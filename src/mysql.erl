@@ -891,7 +891,7 @@ encode(Val, true) when is_binary(Val) ->
 encode(Val, true) ->
     list_to_binary(encode(Val,false));
 encode(Val, false) when is_atom(Val) ->
-    atom_to_list(Val);
+    quote(atom_to_list(Val));
 encode(Val, false) when is_list(Val) ->
     quote(Val);
 encode(Val, false) when is_integer(Val) ->
