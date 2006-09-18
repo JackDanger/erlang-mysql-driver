@@ -899,10 +899,16 @@ encode(Val, false) when is_integer(Val) ->
 encode(Val, false) when is_float(Val) ->
     [Res] = io_lib:format("~w", [Val]),
     Res;
+encode({datetime, Val}, AsBinary) ->
+    encode(Val, AsBinary);
 encode({{Year, Month, Day}, {Hour, Minute, Second}}, false) ->
     Res = io_lib:format("'~B~B~B~B~B~B'", [Year, Month, Day, Hour,
 					  Minute, Second]),
     lists:flatten(Res);
+encode({TimeType, Val}, AsBinary)
+  when TimeType == 'date';
+       TimeType == 'time' ->
+    encode(Val, AsBinary);
 encode({Time1, Time2, Time3}, false) ->
     Res = io_lib:format("'~B~B~B'", [Time1, Time2, Time3]),
     lists:flatten(Res);

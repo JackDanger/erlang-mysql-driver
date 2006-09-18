@@ -710,15 +710,15 @@ convert_type(Val, ColType) ->
 	       T == 'DATETIME' ->
 	    {ok, [Year, Month, Day, Hour, Minute, Second], _Leftovers} =
 		io_lib:fread("~d-~d-~d ~d:~d:~d", binary_to_list(Val)),
-	    {{Year, Month, Day}, {Hour, Minute, Second}};
+	    {datetime, {{Year, Month, Day}, {Hour, Minute, Second}}};
 	'TIME' ->
 	    {ok, [Hour, Minute, Second], _Leftovers} =
 		io_lib:fread("~d:~d:~d", binary_to_list(Val)),
-	    {Hour, Minute, Second};
+	    {time, {Hour, Minute, Second}};
 	'DATE' ->
 	    {ok, [Year, Month, Day], _Leftovers} =
 		io_lib:fread("~d-~d-~d", binary_to_list(Val)),
-	    {Year, Month, Day};
+	    {date, {Year, Month, Day}};
 	T when T == 'DECIMAL';
 	       T == 'FLOAT' ->
 	    {ok, [Num], _Leftovers} =
