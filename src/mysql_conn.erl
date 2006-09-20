@@ -720,7 +720,8 @@ convert_type(Val, ColType) ->
 		io_lib:fread("~d-~d-~d", binary_to_list(Val)),
 	    {date, {Year, Month, Day}};
 	T when T == 'DECIMAL';
-	       T == 'FLOAT' ->
+	       T == 'FLOAT';
+	       T == 'DOUBLE' ->
 	    {ok, [Num], _Leftovers} =
 		case io_lib:fread("~f", binary_to_list(Val)) of
 		    {error, _} ->
