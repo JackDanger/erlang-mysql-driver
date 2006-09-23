@@ -13,6 +13,9 @@
 %%% Added automatic type conversion between MySQL types and Erlang types
 %%% and different logging style.
 %%%
+%%% Modified: 23 Sep 2006 by Yariv Sadan <yarivvv@gmail.com>
+%%% Added transaction handling and prepared statement execution.
+%%%
 %%% Copyright (c) 2001-2004 Kungliga Tekniska Högskolan
 %%% See the file COPYING
 %%%
@@ -71,10 +74,15 @@
 	 start_link/6,
 	 fetch/3,
 	 fetch/4,
-	 
-	 fetch_queries/4,
-	 fetch_queries/5
+	 execute/5,
+	 execute/6,
+	 transaction/3,
+	 transaction/4
 	]).
+
+%% private exports to be called only from the 'mysql' module
+-export([fetch_local/2,
+	 execute_local/3]).
 
 %%--------------------------------------------------------------------
 %% External exports (should only be used by the 'mysql_auth' module)
@@ -88,7 +96,8 @@
 	  log_fun,
 	  recv_pid,
 	  socket,
-	  data
+	  data,
+	  prepares = gb_trees:empty() %% maps statement names to their versions
 	 }).
 
 -define(SECURE_CONNECTION, 32768).
@@ -96,6 +105,10 @@
 -define(DEFAULT_STANDALONE_TIMEOUT, 5000).
 -define(MYSQL_4_0, 40). %% Support for MySQL 4.0.x
 -define(MYSQL_4_1, 41). %% Support for MySQL 4.1.x et 5.0.x
+
+%% Used by transactions to get the state variable for this connection
+%% when bypassing the dispatcher.
+-define(STATE_VAR, mysql_connection_state).
 
 -define(Log(LogFun,Level,Msg),
 	LogFun(?MODULE, ?LINE,Level,fun()-> {Msg,[]} end)).
@@ -158,16 +171,21 @@ post_start(Pid, LogFun) ->
 %% Function: fetch(Pid, Query, From)
 %%           fetch(Pid, Query, From, Timeout)
 %%           Pid     = pid(), mysql_conn to send fetch-request to
-%%           Query   = string(), MySQL query in verbatim
+%%           Queries   = A single binary() query or a list of binary() queries.
+%%                     If a list is provided, the return value is the return
+%%                     of the last query, or the first query that has
+%%                     returned an error. If an error occurs, execution of
+%%                     the following queries is aborted.
 %%           From    = pid() or term(), use a From of self() when
 %%                     using this module for a single connection,
 %%                     or pass the gen_server:call/3 From argument if
 %%                     using a gen_server to do the querys (e.g. the
 %%                     mysql_dispatcher)
 %%           Timeout = integer() | infinity, gen_server timeout value
-%% Descrip.: Send a query and wait for the result if running stand-
-%%           alone (From = self()), but don't block the caller if we
-%%           are not running stand-alone (From = gen_server From).
+%% Descrip.: Send a query or a list of queries and wait for the result
+%%           if running stand-alone (From = self()), but don't block
+%%           the caller if we are not running stand-alone
+%%           (From = gen_server From).
 %% Returns : ok                        | (non-stand-alone mode)
 %%           {data, #mysql_result}     | (stand-alone mode)
 %%           {updated, #mysql_result}  | (stand-alone mode)
@@ -176,39 +194,34 @@ post_start(Pid, LogFun) ->
 %%           Rows      = list() of [string()]
 %%           Reason    = term()
 %%--------------------------------------------------------------------
-fetch(Pid, Query, From) ->
-    fetch(Pid, Query, From, ?DEFAULT_STANDALONE_TIMEOUT).
+fetch(Pid, Queries, From) ->
+    fetch(Pid, Queries, From, ?DEFAULT_STANDALONE_TIMEOUT).
 
-fetch(Pid, Query, From, Timeout)  ->
-    fetch_queries(Pid, [Query], From, false, Timeout).
+fetch(Pid, Queries, From, Timeout)  ->
+    do_fetch(Pid, Queries, From, Timeout).
 
+execute(Pid, Name, Version, Params, From) ->
+    execute(Pid, Name, Version, Params, From, ?DEFAULT_STANDALONE_TIMEOUT).
 
-%% Like fetch/3 and fetch/4, but using a list of queries.
-%% The return value is the the return value for the last query. If
-%% a query returns an error response before the last query is executed,
-%% the error is returned and the execution of the following queries is
-%% aborted.
-fetch_queries(Pid, Queries, From, RollbackOnError) ->
-    fetch_queries(Pid, Queries, From, RollbackOnError,
-		  ?DEFAULT_STANDALONE_TIMEOUT).
+execute(Pid, Name, Version, Params, From, Timeout) ->
+    send_msg(Pid, {execute, Name, Version, Params, From}, From, Timeout).
 
-fetch_queries(Pid, Queries, From, RollbackOnError, Timeout) ->
-    Self = self(),
-    Pid ! {fetch, Queries, From, RollbackOnError},
-    case From of
-	Self ->
-	    %% We are not using a mysql_dispatcher, await the response
-	    receive
-		{fetch_result, Pid, Result} ->
-		    Result
-	    after Timeout ->
-		    {error, "query timed out"}
-	    end;
-	_ ->
-	    %% From is gen_server From, Pid will do gen_server:reply() when it has an answer
-	    ok
-    end.
-     
+transaction(Pid, Fun, From) ->
+    transaction(Pid, Fun, From, ?DEFAULT_STANDALONE_TIMEOUT).
+
+transaction(Pid, Fun, From, Timeout) ->
+    send_msg(Pid, {transaction, Fun, From}, From, Timeout).
+
+%%====================================================================
+%% Internal functions
+%%====================================================================
+
+fetch_local(State, Query) ->
+    do_query(State, Query).
+
+execute_local(State, Name, Params) ->
+    do_execute(State, Name, Params, undefined).
+
 %%--------------------------------------------------------------------
 %% Function: do_recv(LogFun, RecvPid, SeqNum)
 %%           LogFun  = undefined | function() with arity 3
@@ -223,26 +236,47 @@ fetch_queries(Pid, Queries, From, RollbackOnError, Timeout) ->
 %%
 %% Note    : Only to be used externally by the 'mysql_auth' module.
 %%--------------------------------------------------------------------
-do_recv(LogFun, RecvPid, SeqNum) when is_function(LogFun); LogFun == undefined, SeqNum == undefined ->
+do_recv(LogFun, RecvPid, SeqNum)  when is_function(LogFun);
+				       LogFun == undefined,
+				       SeqNum == undefined ->
     receive
         {mysql_recv, RecvPid, data, Packet, Num} ->
 	    {ok, Packet, Num};
 	{mysql_recv, RecvPid, closed, _E} ->
 	    {error, "mysql_recv: socket was closed"}
     end;
-do_recv(LogFun, RecvPid, SeqNum) when is_function(LogFun); LogFun == undefined, is_integer(SeqNum) ->
+do_recv(LogFun, RecvPid, SeqNum) when is_function(LogFun);
+				      LogFun == undefined,
+				      is_integer(SeqNum) ->
     ResponseNum = SeqNum + 1,
     receive
         {mysql_recv, RecvPid, data, Packet, ResponseNum} ->
 	    {ok, Packet, ResponseNum};
 	{mysql_recv, RecvPid, closed, _E} ->
 	    {error, "mysql_recv: socket was closed"}
-        end.
+    end.
 
+do_fetch(Pid, Queries, From, Timeout) ->
+    send_msg(Pid, {fetch, Queries, From}, From, Timeout).
 
-%%====================================================================
-%% Internal functions
-%%====================================================================
+send_msg(Pid, Msg, From, Timeout) ->
+    Self = self(),
+    Pid ! Msg,
+    case From of
+	Self ->
+	    %% We are not using a mysql_dispatcher, await the response
+	    receive
+		{fetch_result, Pid, Result} ->
+		    Result
+	    after Timeout ->
+		    {error, "message timed out"}
+	    end;
+	_ ->
+	    %% From is gen_server From,
+	    %% Pid will do gen_server:reply() when it has an answer
+	    ok
+    end.
+
 
 %%--------------------------------------------------------------------
 %% Function: init(Host, Port, User, Password, Database, LogFun,
@@ -264,7 +298,10 @@ init(Host, Port, User, Password, Database, LogFun, Parent) ->
 	{ok, RecvPid, Sock} ->
 	    case mysql_init(Sock, RecvPid, User, Password, LogFun) of
 		{ok, Version} ->
-		    case do_query(Sock, RecvPid, LogFun, "use " ++ Database, Version) of
+		    Db = iolist_to_binary(Database),
+		    case do_query(Sock, RecvPid, LogFun,
+				  <<"use ", Db/binary>>,
+				  Version) of
 			{error, MySQLRes} ->
 			    ?Log2(LogFun, error,
 				 "mysql_conn: Failed changing to database "
@@ -306,18 +343,32 @@ loop(State) ->
     RecvPid = State#state.recv_pid,
     LogFun = State#state.log_fun,
     receive
-	{fetch, Queries, GenSrvFrom, RollbackOnError} ->
-	    %% GenSrvFrom is either a gen_server:call/3 From term(),
-	    %% or a pid if no gen_server was used to make the query
-	    Res = do_queries(State, Queries, RollbackOnError),
-	    case is_pid(GenSrvFrom) of
-		true ->
-		    %% The query was not sent using gen_server mechanisms
-		    GenSrvFrom ! {fetch_result, self(), Res};
-		false ->
-		    gen_server:reply(GenSrvFrom, Res)
-	    end,
+	{fetch, Queries, From} ->
+	    send_reply(From, do_queries(State, Queries)),
 	    loop(State);
+	{transaction, Fun, From} ->
+	    put(?STATE_VAR, State),
+
+	    Res = do_transaction(State, Fun),
+
+	    %% The transaction may have changed the state of this process
+	    %% if it has executed prepared statements. This would happen in
+	    %% mysql:execute.
+	    State1 = get(?STATE_VAR),
+
+	    send_reply(From, Res),
+	    loop(State1);
+	{execute, Name, Version, Params, From} ->
+	    State1 =
+		case do_execute(State, Name, Params, Version) of
+		    {error, _} = Err ->
+			send_reply(From, Err),
+			State;
+		    {ok, Result, NewState} ->
+			send_reply(From, Result),
+			NewState
+		end,
+	    loop(State1);
 	{mysql_recv, RecvPid, data, Packet, Num} ->
 	    ?Log2(LogFun, error,
 		 "received data when not expecting any -- "
@@ -328,6 +379,155 @@ loop(State) ->
 		  "received unknown signal, exiting: ~p", [Unknown]),
 	    error
     end.
+
+%% GenSrvFrom is either a gen_server:call/3 From term(),
+%% or a pid if no gen_server was used to make the query
+send_reply(GenSrvFrom, Res) when is_pid(GenSrvFrom) ->
+    %% The query was not sent using gen_server mechanisms       
+    GenSrvFrom ! {fetch_result, self(), Res};
+send_reply(GenSrvFrom, Res) ->
+    gen_server:reply(GenSrvFrom, Res).
+
+do_query(State, Query) ->
+    do_query(State#state.socket,
+	       State#state.recv_pid,
+	       State#state.log_fun,
+	       Query,
+	       State#state.mysql_version
+	      ).
+
+do_query(Sock, RecvPid, LogFun, Query, Version) ->
+    ?Log2(LogFun, debug, "fetch ~p (id ~p)", [Query,RecvPid]),
+    Packet =  <<?MYSQL_QUERY_OP, Query/binary>>,
+    case do_send(Sock, Packet, 0, LogFun) of
+	ok ->
+	    get_query_response(LogFun,RecvPid,
+				    Version);
+	{error, Reason} ->
+	    Msg = io_lib:format("Failed sending data "
+				"on socket : ~p",
+				[Reason]),
+	    {error, Msg}
+    end.
+
+do_queries(State, Queries) when not is_list(Queries) ->
+    do_query(State, Queries);
+do_queries(State, Queries) ->
+    do_queries(State#state.socket,
+	       State#state.recv_pid,
+	       State#state.log_fun,
+	       Queries,
+	       State#state.mysql_version
+	      ).
+
+%% Execute a list of queries, returning the response for the last query.
+%% If a query returns an error before the last query is executed, the
+%% loop is aborted and the error is returned. 
+do_queries(Sock, RecvPid, LogFun, Queries, Version) ->
+    catch
+	lists:foldl(
+	  fun(Query, _LastResponse) ->
+		  case do_query(Sock, RecvPid, LogFun, Query, Version) of
+		      {error, _} = Err -> throw(Err);
+		      Res -> Res
+		  end
+	  end, ok, Queries).
+
+do_transaction(State, Fun) ->
+      case do_query(State, <<"BEGIN">>) of
+ 	{error, _} = Err ->	
+ 	    Err;
+ 	_ ->
+	      case catch Fun() of
+		  {error, _} = Err ->
+		      do_query(State, <<"ROLLBACK">>),
+		      Err;
+		  Res ->
+		      case do_query(State, <<"COMMIT">>) of
+			  {error, _} = Err ->
+			      Err;
+			  _ ->
+			      Res
+		      end
+	      end
+      end.
+
+do_execute(State, Name, Params, ExpectedVersion) ->
+    Res = case gb_trees:lookup(Name, State#state.prepares) of
+	      {value, Version} when Version == ExpectedVersion ->
+		  {ok, latest};
+	      {value, Version} ->
+		  mysql:get_prepared(Name, Version);
+	      none ->
+		  mysql:get_prepared(Name)
+	  end,
+    case Res of
+	{ok, latest} ->
+	    {ok, do_execute1(State, Name, Params), State};
+	{ok, {Stmt, NewVersion}} ->
+	    prepare_and_exec(State, Name, NewVersion, Stmt, Params);
+	{error, _} = Err ->
+	    Err
+    end.
+
+prepare_and_exec(State, Name, Version, Stmt, Params) ->
+    NameBin = atom_to_binary(Name),
+    StmtBin = <<"PREPARE ", NameBin/binary, " FROM '",
+		Stmt/binary, "'">>,
+    case do_query(State, StmtBin) of
+	{updated, _} ->
+	    State1 =
+		State#state{
+		  prepares = gb_trees:enter(Name, Version,
+					    State#state.prepares)},
+	    {ok, do_execute1(State1, Name, Params), State1};
+	{error, _} = Err ->
+	    Err;
+	Other ->
+	    ?L(Other),
+	    {error, foo}
+    end.
+
+do_execute1(State, Name, Params) ->
+    Stmts = make_statements_for_execute(Name, Params),
+    do_queries(State, Stmts).
+
+make_statements_for_execute(Name, []) ->
+    NameBin = atom_to_binary(Name),
+    [<<"EXECUTE ", NameBin/binary>>];
+make_statements_for_execute(Name, Params) ->
+    NumParams = length(Params),
+    ParamNums = lists:seq(1, NumParams),
+
+    NameBin = atom_to_binary(Name),
+    
+    ParamNames =
+	lists:foldl(
+	  fun(Num, Acc) ->
+		  ParamName = [$@ | integer_to_list(Num)],
+		  if Num == 1 ->
+			  ParamName ++ Acc;
+		     true ->
+			  [$, | ParamName] ++ Acc
+		  end
+	  end, [], lists:reverse(ParamNums)),
+    ParamNamesBin = list_to_binary(ParamNames),
+
+    ExecStmt = <<"EXECUTE ", NameBin/binary, " USING ",
+		ParamNamesBin/binary>>,
+
+    ParamVals = lists:zip(ParamNums, Params),
+    Stmts = lists:foldl(
+	      fun({Num, Val}, Acc) ->
+		      NumBin = mysql:encode(Num, true),
+		      ValBin = mysql:encode(Val, true),
+		      [<<"SET @", NumBin/binary, "=", ValBin/binary>> | Acc]
+	       end, [ExecStmt], lists:reverse(ParamVals)),
+    Stmts.
+
+atom_to_binary(Val) ->
+    <<_:4/binary, Bin/binary>> = term_to_binary(Val),
+    Bin.
 
 %%--------------------------------------------------------------------
 %% Function: mysql_init(Sock, RecvPid, User, Password, LogFun)
@@ -432,7 +632,8 @@ get_query_response(LogFun, RecvPid, Version) ->
 			{ok, Fields} ->
 			    case get_rows(Fields, LogFun, RecvPid, []) of
 				{ok, Rows} ->
-				    {data, #mysql_result{fieldinfo=Fields, rows=Rows}};
+				    {data, #mysql_result{fieldinfo=Fields,
+							 rows=Rows}};
 				{error, Reason} ->
 				    {error, #mysql_result{error=Reason}}
 			    end;
@@ -566,70 +767,6 @@ get_with_length(<<254:8, Length:64/little, Rest/binary>>) ->
 get_with_length(<<Length:8, Rest/binary>>) when Length < 251 ->
     split_binary(Rest, Length).
 
-
-do_query(Sock, RecvPid, LogFun, Query, Version) ->
-    do_queries(Sock, RecvPid, LogFun, [Query], Version, false).
-
-%% Execute a list of queries and return the return value from
-%% the last query.
-do_queries(State, Queries, RollbackOnError) ->
-    do_queries(State#state.socket,
-	       State#state.recv_pid,
-	       State#state.log_fun,
-	       Queries,
-	       State#state.mysql_version,
-	       RollbackOnError
-	      ).
-
-%% Execute a list of queries, returning the response for the last query.
-%% If a query returns an error before the last query is executed, the
-%% loop is aborted and the error is returned. In addtion, if an error
-%% occurs and RollbackOnError is set to 'true', a "ROLLBACK" command will
-%% be attempted.
-do_queries(Sock, RecvPid, LogFun, Queries, Version, RollbackOnError) ->
-    do_queries(Sock, RecvPid, LogFun, Queries, Version, RollbackOnError, true).
-
-do_queries(Sock, RecvPid, LogFun, Queries, Version, RollbackOnError,
-	   IsFirstAttempt) ->
-    case {RollbackOnError, IsFirstAttempt,
-	  catch
-	lists:foldl(
-	  fun(Query, _LastResponse) ->
-		  ?Log2(LogFun, debug, "fetch ~p (id ~p)",
-			[Query,RecvPid]),
-		  Query1 =
-		      if
-			  is_list(Query) ->
-			      list_to_binary(Query);
-			  true ->
-			      Query
-		      end,
-		  Packet =  <<?MYSQL_QUERY_OP, Query1/binary>>,
-		  case do_send(Sock, Packet, 0, LogFun) of
-		      ok ->
-			  case get_query_response(LogFun,RecvPid,
-						  Version) of
-			      {error, _Err} = Err ->
-				  throw(Err);
-			      Response ->
-				  Response
-			  end;
-		      {error, Reason} ->
-			  Msg = io_lib:format("Failed sending data "
-					      "on socket : ~p",
-					      [Reason]),
-			  throw({error, Msg})
-		  end
-	  end, ok, Queries)}
-	of
-	{true, true, {error, _} = Result} ->
-	    do_queries(Sock, RecvPid, LogFun, [<<"ROLLBACK">>], Version,
-		       RollbackOnError, false),
-	    Result;
-	{_, _, Other} ->
-	    Other
-    end.
-	    
 
 %%--------------------------------------------------------------------
 %% Function: do_send(Sock, Packet, SeqNum, LogFun)

@@ -1,4 +1,3 @@
-%%%-------------------------------------------------------------------
 %%% File    : mysql.erl
 %%% Author  : Magnus Ahltorp <ahltorp@nada.kth.se>
 %%% Descrip.: MySQL client.
@@ -8,10 +7,16 @@
 %%% Copyright (c) 2001-2004 Kungliga Tekniska Högskolan
 %%% See the file COPYING
 %%%
-%%% Modified : 9/12/2006 by Yariv Sadan <yarivvv@gmail.com>
-%%% Note: I added many improvements, including prepared statements,
+%%% Modified: 9/12/2006 by Yariv Sadan <yarivvv@gmail.com>
+%%% Note: Added support for prepared statements,
 %%% transactions, better connection pooling, more efficient logging
-%%% and other internal enhancements.
+%%% and made other internal enhancements.
+%%%
+%%% Modified: 9/23/2006 Rewrote the transaction handling code to
+%%% provide a simpler, Mnesia-style transaction interface. Also,
+%%% moved much of the prepared statement handling code to mysql_conn.erl
+%%% and added versioning to prepared statements.
+%%% 
 %%%
 %%% Usage:
 %%%
@@ -59,35 +64,34 @@
 %%% connections yourself, you can use the mysql_conn module as a
 %%% stand-alone single MySQL connection. See the comment at the top of
 %%% mysql_conn.erl.
-%%%
-%%%-------------------------------------------------------------------
+
 -module(mysql).
 -behaviour(gen_server).
 
-%%--------------------------------------------------------------------
+
+%% @type mysql_result() = term()
+%% @type query_result = {data, mysql_result()} | {updated, mysql_result()} |
+%%   {error, mysql_result()}
+
+
 %% External exports
-%%--------------------------------------------------------------------
 -export([start_link/5,
 	 start_link/6,
 	 start_link/7,
 
+	 connect/7,
+
 	 fetch/2,
 	 fetch/3,
-
+	 
 	 prepare/2,
 	 execute/2,
 	 execute/3,
 	 execute/4,
 	 unprepare/1,
+	 get_prepared/1,
+	 get_prepared/2,
 
-	 new_transaction/1,
-	 add_query/2,
-	 add_queries/2,
-	 add_execute/2,
-	 add_execute/3,
-	 add_executes/2,
-	 commit/1,
-	 commit/2,
 	 transaction/2,
 	 transaction/3,
 
@@ -98,21 +102,15 @@
 
 	 encode/1,
 	 encode/2,
-	 quote/1,
 	 asciz_binary/2,
 
-	 connect/7
 	]).
 
-%%--------------------------------------------------------------------
 %% Internal exports - just for mysql_* modules
-%%--------------------------------------------------------------------
 -export([log/4
 	]).
 
-%%--------------------------------------------------------------------
 %% Internal exports - gen_server callbacks
-%%--------------------------------------------------------------------
 -export([init/1,
 	 handle_call/3,
 	 handle_cast/2,
@@ -121,13 +119,11 @@
 	 code_change/3
 	]).
 
-%%--------------------------------------------------------------------
 %% Records
-%%--------------------------------------------------------------------
 -include("mysql.hrl").
 
 -record(conn, {
-	  pool_id,           %% atom(), the pool's Id
+	  pool_id,      %% atom(), the pool's id
 	  pid,          %% pid(), mysql_conn process	 
 	  reconnect,	%% true | false, should mysql_dispatcher try
                         %% to reconnect if this connection dies?
@@ -135,35 +131,30 @@
 	  port,		%% integer()
 	  user,		%% string()
 	  password,	%% string()
-	  database,	%% string()
-
-	  prepares = gb_sets:empty() %% a set of StmtName atoms() indicating
-	      %% which statements were prepared for this connection
+	  database	%% string()
 	 }).
-
 
 -record(state, {
-	  conn_pools = gb_trees:empty(), %% gb_tree mapping connection
-	                %% pool id to a connection pool tuple
+	  %% gb_tree mapping connection
+	  %% pool id to a connection pool tuple
+	  conn_pools = gb_trees:empty(), 
+	                
 
-	  pids_pools = gb_trees:empty(), %% gb_tree mapping connection Pid
-	                                 %% to pool id
+	  %% gb_tree mapping connection Pid
+	  %% to pool id
+	  pids_pools = gb_trees:empty(), 
+	                                 
+	  %% function for logging,
+	  log_fun,	
 
-	  log_fun,	%% function for logging,
 
-	  prepares = gb_trees:empty() %% maps StmtName (atom()) to binary()
+	  %% maps names to {Statement::binary(), Version::integer()} values
+	  prepares = gb_trees:empty()
 	 }).
 
--record(transaction,
-	{pool_id,
-	 queries = [<<"BEGIN">>],
-	 prepares = gb_sets:empty()
-	}).
-
-%%--------------------------------------------------------------------
 %% Macros
-%%--------------------------------------------------------------------
 -define(SERVER, mysql_dispatcher).
+-define(STATE_VAR, mysql_connection_state).
 -define(CONNECT_TIMEOUT, 5000).
 -define(LOCAL_FILES, 128).
 -define(PORT, 3306).
@@ -185,26 +176,16 @@ log(Module, Line, _Level, FormatFun) ->
     io:format("~w:~b: "++ Format ++ "~n", [Module, Line] ++ Arguments).
 
 
-%%====================================================================
 %% External functions
-%%====================================================================
 
-%%--------------------------------------------------------------------
-%% Function: start_link(PoolId, Host, User, Password, Database)
-%%           start_link(PoolId, Host, Port, User, Password, Database)
-%%           start_link(PoolId, Host, User, Password, Database, LogFun)
-%%           start_link(PoolId, Host, Port, User, Password, Database,
-%%                      LogFun)
-%%           PoolId       = term(), first connection pool id
-%%           Host     = string()
-%%           Port     = integer()
-%%           User     = string()
-%%           Password = string()
-%%           Database = string()
-%%           LogFun   = undefined | function() of arity 3
-%% Descrip.: Starts the MySQL client gen_server process.
-%% Returns : {ok, Pid} | ignore | {error, Error}
-%%--------------------------------------------------------------------
+%% @doc Starts the MySQL client gen_server process.
+%%
+%% The Port and LogFun parameters are optional.
+%%
+%% @spec start_link(PoolId::atom(), Host::string(), Port::integer(),
+%%   Username::string(), Password::string(), Database::string(),
+%%   LogFun::undefined | function() of arity 4) ->
+%%     {ok, Pid} | ignore | {error, Err}
 start_link(PoolId, Host, User, Password, Database) ->
     start_link(PoolId, Host, ?PORT, User, Password, Database, undefined).
 
@@ -220,196 +201,167 @@ start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
       {local, ?SERVER}, ?MODULE,
       [PoolId, Host, Port, User, Password, Database, LogFun], []).
 
-%%--------------------------------------------------------------------
-%% Function: fetch(PoolId, Query)
-%%           fetch(PoolId, Query, Timeout)
-%%           PoolId      = term(), connection pool Id
-%%           Query   = string(), MySQL query in verbatim
-%%           Timeout = integer() | infinity, gen_server timeout value
-%% Descrip.: Send a query and wait for the result.
-%% Returns : {data, MySQLRes}    |
-%%           {updated, MySQLRes} | 
-%%           {error, MySQLRes}
-%%           MySQLRes = term()
-%%--------------------------------------------------------------------
+
+
+get_state() ->
+    gen_server:call(?SERVER, get_state).
+
+
+%% @doc Fetch a query inside a transaction.
+%%
+%% @spec fetch(Query::iolist()) -> query_result()
+fetch(Query) ->
+    in_transaction(
+      fun(State) ->
+	      mysql_conn:fetch_local(State, iolist_to_binary(Query))
+      end).
+
+%% @doc Send a query to a connection from the connection pool and wait
+%%   for the result. If this function is called inside a transaction,
+%%   the PoolId parameter is ignored.
+%%
+%% @spec fetch(PoolId::atom(), Query::iolist(), Timeout::integer()) ->
+%%   query_result()
 fetch(PoolId, Query) ->
-    gen_server:call(?SERVER, {fetch, PoolId, Query}).
+    fetch(PoolId, Query, undefined).
+
 fetch(PoolId, Query, Timeout) -> 
-   gen_server:call(?SERVER, {fetch, PoolId, Query}, Timeout).
+    Query1 = iolist_to_binary(Query),
+    if_in_transaction(
+      fun(State) ->
+	      mysql_conn:fetch_local(State, Query1)
+      end,
+      {fetch, PoolId, Query1}).
 
+%% @doc Register a prepared statement with the dispatcher. This call does not
+%%   prepare the statement in any connections. The statement is prepared
+%%   lazily in each connection when it is told to execute the statement.
+%%   If the Name parameter matches the name of a statement that has
+%%   already been registered, the version of the statement is incremented
+%%   and all connections that have already prepared the statement will
+%%   prepare it again with the newest version.
+%%
+%% @spec prepare(Name::atom(), Query::iolist()) -> ok
 prepare(Name, Query) ->
-    gen_server:cast(?SERVER, {prepare, Name, Query}).
+    gen_server:cast(?SERVER, {prepare, Name, iolist_to_binary(Query)}).
 
+%% @doc Unregister a statement that has previously been register with
+%%   the dispatcher. All calls to execute() with the given statement
+%%   will fail once the statement is unprepared. If the statement hasn't
+%%   been prepared, nothing happens.
+%%
+%% @spec unprepare(Name::atom()) -> ok
 unprepare(Name) ->
     gen_server:cast(?SERVER, {unprepare, Name}).
 
-execute(PoolId, Name) ->
+%% @doc Get the prepared statement with the given name.
+%%
+%%  This function is called from mysql_conn when the connection is
+%%  told to execute a prepared statement it has not yet prepared, or
+%%  when it is told to execute a statement inside a transaction and
+%%  it's not sure that it has the latest version of the statement.
+%%
+%%  If the latest version of the prepared statement matches the Version
+%%  parameter, the return value is {ok, latest}. This saves the cost
+%%  of sending the query when the connection already has the latest version.
+%%
+%% @spec get_prepared(Name::atom(), Version::integer()) ->
+%%   {ok, latest} | {ok, Statement::binary()} | {error, Err}
+get_prepared(Name) ->
+    get_prepared(Name, undefined).
+get_prepared(Name, Version) ->
+    gen_server:call(?SERVER, {get_prepared, Name, Version}).
+
+
+%% @doc Execute a query inside a transaction.
+%%
+%% @spec execute(Name::atom, Params::[term()]) -> mysql_result()
+execute(Name) ->
+    execute(Name, []).
+
+execute(Name, Params) when is_atom(Name), is_list(Params) ->
+    in_transaction(
+      fun(State) ->
+	      mysql_conn:execute_local(State, Name, Params)
+      end);
+
+%% @doc Execute a query in the connection pool identified by
+%% PoolId. This function optionally accepts a list of parameters to pass
+%% to the prepared statement and a Timeout parameter.
+%% If this function is called inside a transaction, the PoolId paramter is
+%% ignored.
+%%
+%% @spec execute(PoolId::atom(), Name::atom(), Params::[term()],
+%%   Timeout::integer()) -> mysql_result()
+execute(PoolId, Name) when is_atom(PoolId), is_atom(Name) ->
     execute(PoolId, Name, []).
 
 execute(PoolId, Name, Timeout) when is_integer(Timeout) ->
     execute(PoolId, Name, [], Timeout);
 
-execute(PoolId, Name, Params) ->
-    gen_server:call(?SERVER, {execute, PoolId, Name, Params}).
+execute(PoolId, Name, Params) when is_list(Params) ->
+    execute(PoolId, Name, Params, undefined).
 
 execute(PoolId, Name, Params, Timeout) ->
-    gen_server:call(?SERVER, {execute, PoolId, Name, Params}, Timeout).
+    if_in_transaction(
+      fun(State) ->
+	      case mysql_conn:execute_local(State, Name, Params) of
+		  {ok, Res, NewState} ->
+		      put(?STATE_VAR, NewState),
+		      Res;
+		  Err ->
+		      Err
+	      end
+      end,
+      {execute, PoolId, Name, Params}).
 
-
-%%-------------------------------------------------------------------
-%% Function: new_transaction(PoolId)
-%%           PoolId = atom() the connection pool id
-%% Descrip.: Create a transaction for a previously-created connection
-%%           identified by the PoolId parameter.
-%% Returns:  a new transaction record
-%%-----------------------------------------------------------------
-new_transaction(PoolId) ->
-    #transaction{pool_id = PoolId}.
-
-%%-------------------------------------------------------------------
-%% Function: add_query(Transaction, Query)
-%%           Transaction = transaction()
-%%           Query = binary() | string()  the SQL query
-%% Descrip.: Add a query to the transaction record, which was started
-%%           with start_transaction/1
-%% Returns:  ok
-%%-----------------------------------------------------------------
-
-add_query(Transaction, Query) when is_list(Query) ->
-    add_query(Transaction, list_to_binary(Query));
-
-add_query(#transaction{queries = Queries} = Transaction, Query) ->
-    Transaction#transaction{queries = [Query|Queries]}.
-
-%% Performs add_query on a list of queries
-add_queries(Transaction, QueryList) ->
-    lists:foldl(
-      fun(Query, T1) ->
-	      add_query(T1, Query)
-      end, Transaction, QueryList).
-
-
-%%-------------------------------------------------------------------
-%% Function: add_execute(Transaction, StmtName, Params)
-%%           Transaction = transaction()
-%%           StmtName = atom() the name of a prepared statement previosly
-%%           created with prepare/1
-%%           Params = [term()] (optional) the list of parameters for the
-%%           prepared statement. The size of the list must match the
-%%           arity of the prepared statement, or MySQL will report an error.
-%%           If the statement takes no parameters, you can call
-%%           add_execute/2.
-%% Descrip.: add a prepared statement execution to the transaction
-%% Returns:  the modified transaction record
-%%-----------------------------------------------------------------
-
-add_execute(Transaction, StmtName) ->
-    add_execute(Transaction, StmtName, []).
-
-add_execute(#transaction{queries = Queries,
-			 prepares = Prepares} = Transaction,
-	    StmtName, Params) ->
-    Stmts = make_statements_for_execute(StmtName, Params),
-    Transaction#transaction{queries = lists:reverse(Stmts) ++ Queries,
-			    prepares = gb_sets:add(StmtName, Prepares)}.
-
-%% Performs add_execute on a list of StmtName atoms and/or
-%% {StmtName, Params} tuples.
-add_executes(Transaction, Executes) ->
-    lists:foldl(
-      fun({StmtName, Params}, T1) ->
-	      add_execute(T1, StmtName, Params);
-	 (StmtName, T1) ->
-	      add_execute(T1, StmtName)
-      end, Transaction, Executes).
-
-%%-------------------------------------------------------------------
-%% Function: commit(Transaction)
-%%           transaction = transaction()
-%% Descrip.: Commit the current transaction.
-%% Returns:  {updated, MySQLRes} | {error, MySQLRes}
-%%           MySQLRes = term()
-%%-----------------------------------------------------------------
-commit(Transaction) ->
-    gen_server:call(?SERVER, {commit, Transaction}).
-
-commit(Transaction, Timeout) ->
-    gen_server:call(?SERVER, {commit, Transaction}, Timeout).
-
-%%-------------------------------------------------------------------
-%% Function: transaction(PoolId, Fun)
-%%           Id = atom() the connection pool id
-%%           Fun = function(Transaction) -> NewTransaction
-%%             a function containing one or more
-%%             calls to add_query/2 or add_execute/3.
-%% Descrip.: Execute the function Fun in a transaction context.
-%% Returns:  {updated, MySQLRes} | {error, MySQLRes}
-%%           MySQLRes = term()
-%%-----------------------------------------------------------------
+%% @doc Execute a transaction in a connection belonging to the connection pool.
+%% Fun is a function containing a sequence of calls to fetch() and/or
+%% execute().
+%% If this function returns {error, Err} or if it throws an exception
+%% of type {error, Err}, the transaction is automatically rolled back.
+%% The return value of this call is the return value of the Fun.
+%%
+%% @spec transaction(PoolId::atom(), Fun::function()) -> Result
 transaction(PoolId, Fun) ->
-    Transaction = new_transaction(PoolId),
-    NewTransaction = Fun(Transaction),
-    commit(NewTransaction).
+    gen_server:call(?SERVER, {transaction, PoolId, Fun}).
 
 transaction(PoolId, Fun, Timeout) ->
-    Transaction = new_transaction(PoolId),
-    NewTransaction = Fun(Transaction),
-    commit(NewTransaction, Timeout).
+    gen_server:call(?SERVER, {transaction, PoolId, Fun}, Timeout).
 
-%%--------------------------------------------------------------------
-%% Function: get_result_field_info(MySQLRes)
-%%           MySQLRes = term(), result of fetch function on "data"
-%% Descrip.: Extract the FieldInfo from MySQL Result on data received
-%% Returns : FieldInfo
-%%           FieldInfo = list() of {Table, Field, Length, Name}
-%%--------------------------------------------------------------------
+%% @doc Extract the FieldInfo from MySQL Result on data received.
+%%
+%% @spec get_result_field_info(MySQLRes::mysql_result()) ->
+%%   [{Table, Field, Length, Name}]
 get_result_field_info(#mysql_result{fieldinfo = FieldInfo}) ->
     FieldInfo.
 
-%%--------------------------------------------------------------------
-%% Function: get_result_rows(MySQLRes)
-%%           MySQLRes = term(), result of fetch function on "data"
-%% Descrip.: Extract the Rows from MySQL Result on data received
-%% Returns : Rows
-%%           Rows = list() of list() representing records
-%%--------------------------------------------------------------------
+%% @doc Extract the Rows from MySQL Result on data received
+%% 
+%% @spec get_result_rows(MySQLRes::mysql_result()) -> [Row::list()]
 get_result_rows(#mysql_result{rows=AllRows}) ->
     AllRows.
 
-%%--------------------------------------------------------------------
-%% Function: get_result_affected_rows(MySQLRes)
-%%           MySQLRes = term(), result of fetch function on "updated"
-%% Descrip.: Extract the Rows from MySQL Result on update
-%% Returns : AffectedRows
-%%           AffectedRows = integer()
-%%--------------------------------------------------------------------
+%% @doc Extract the Rows from MySQL Result on update
+%%
+%% @spec get_result_affected_rows(MySQLRes::mysql_result()) ->
+%%           AffectedRows::integer()
 get_result_affected_rows(#mysql_result{affectedrows=AffectedRows}) ->
     AffectedRows.
 
-%%--------------------------------------------------------------------
-%% Function: get_result_reason(MySQLRes)
-%%           MySQLRes = term(), result of fetch function on "error"
-%% Descrip.: Extract the error Reason from MySQL Result on error
-%% Returns : Reason
-%%           Reason    = string()
-%%--------------------------------------------------------------------
+%% @doc Extract the error Reason from MySQL Result on error
+%%
+%% @spec get_result_reason(MySQLRes::mysql_result()) ->
+%%    Reason::string()
 get_result_reason(#mysql_result{error=Reason}) ->
     Reason.
 
-%%--------------------------------------------------------------------
-%% Function: connect(PoolId, Host, Port, User, Password, Database,
-%%                   Reconnect)
-%%           PoolId        = term(), connection-group Id
-%%           Host      = string()
-%%           Port      = undefined | integer()
-%%           User      = string()
-%%           Password  = string()
-%%           Database  = string()
-%%           Reconnect = true | false
-%% Descrip.: Starts a MySQL connection and, if successfull, registers
-%%           it with the mysql_dispatcher.
-%% Returns : {ok, ConnPid} | {error, Reason}
-%%--------------------------------------------------------------------
+%% @doc Starts a MySQL connection and, if successful, add it to the
+%%   connection pool in the dispatcher.
+%%
+%% @spec: connect(PoolId::atom(), Host::string(), Port::integer() | undefined,
+%%    User::string(), Password::string(), Database::string(),
+%%    Reconnect::bool()) -> {ok, ConnPid} | {error, Reason}
 connect(PoolId, Host, undefined, User, Password, Database, Reconnect) ->
     connect(PoolId, Host, ?PORT, User, Password, Database, Reconnect);
 connect(PoolId, Host, Port, User, Password, Database, Reconnect) ->
@@ -448,9 +400,7 @@ new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database) ->
     end.
 
 
-%%====================================================================
 %% gen_server callbacks
-%%====================================================================
 
 init([PoolId, Host, Port, User, Password, Database, LogFun]) ->
     LogFun1 = if LogFun == undefined -> fun log/4; true -> LogFun end,
@@ -467,12 +417,42 @@ init([PoolId, Host, Port, User, Password, Database, LogFun]) ->
 	    {stop, {error, Reason}}
     end.
 
+handle_call(get_state, _From, State) ->
+    {reply, State, State};
 handle_call({fetch, PoolId, Query}, From, State) ->
-    fetch_queries(PoolId, From, State, [Query], false);
+    fetch_queries(PoolId, From, State, [Query]);
 
-handle_call({execute, PoolId, StmtName, Params}, From, State) ->
-    Stmts = make_statements_for_execute(StmtName, Params),
-    fetch_queries(PoolId, From, State, Stmts, [StmtName], false);
+handle_call({get_prepared, Name, Version}, _From, State) ->
+    case gb_trees:lookup(Name, State#state.prepares) of
+	none ->
+	    {reply, {error, {undefined, Name}}, State};
+	{value, {_StmtBin, Version1}} when Version1 == Version ->
+	    {reply, {ok, latest}, State};
+	{value, Stmt} ->
+	    {reply, {ok, Stmt}, State}
+    end;
+
+handle_call({execute, PoolId, Name, Params}, From, State) ->
+    with_next_conn(
+      PoolId, State,
+      fun(Conn, State1) ->
+	      case gb_trees:lookup(Name, State1#state.prepares) of
+		  none ->
+		      {reply, {error, {no_such_statement, Name}}, State1};
+		  {value, {_Stmt, Version}} ->
+		      mysql_conn:execute(Conn#conn.pid, Name,
+					 Version, Params, From),
+		      {noreply, State1}
+	      end
+      end);
+
+handle_call({transaction, PoolId, Fun}, From, State) ->
+    with_next_conn(
+      PoolId, State,
+      fun(Conn, State1) ->
+	      mysql_conn:transaction(Conn#conn.pid, Fun, From),
+	      {noreply, State1}
+      end);
 
 handle_call({add_conn, Conn}, _From, State) ->
     NewState = add_conn(Conn, State),
@@ -484,202 +464,41 @@ handle_call({add_conn, Conn}, _From, State) ->
     {reply, ok, NewState};
 
 handle_call(get_logfun, _From, State) ->
-    {reply, {ok, State#state.log_fun}, State};
+    {reply, {ok, State#state.log_fun}, State}.
 
-handle_call({commit, #transaction{pool_id = PoolId,
-				 queries = Queries,
-				 prepares = Prepares}},
-	     From, State) ->
-    fetch_queries(PoolId, From, State,
-		  lists:reverse([<<"COMMIT">> | Queries]),
-		  gb_sets:to_list(Prepares), true).
-
-fetch_queries(PoolId, From, State, QueryList, RollbackOnError) ->
-    fetch_queries(PoolId, From, State, QueryList, undefined, RollbackOnError).
-
-fetch_queries(PoolId, From, State, QueryList, Prepares, RollbackOnError) ->
-    case get_next_conn(PoolId, State) of
-	{ok, Conn, NewState} ->
-	    Pid = Conn#conn.pid,
-	    ConnPrepares = Conn#conn.prepares,
-	    case make_prepare_queries(State, QueryList, ConnPrepares,
-				      Prepares) of
-		{error, Err} ->
-		    {reply, Err, NewState};
-		{ok, {QueryList2, ConnPrepares2}} -> 
-		    mysql_conn:fetch_queries(Pid, QueryList2, From,
-					     RollbackOnError),
-
-		    %% TODO what if an error occurs on a prepared
-		    %% statement???
-		    Cond = gb_sets:size(ConnPrepares) ==
-			gb_sets:size(ConnPrepares2),
-		    NewState1 =
-			if (Cond) ->
-				NewState;
-			   true ->
-				Conn1 = Conn#conn{prepares=ConnPrepares2},
-				replace_conn(Conn1, NewState)
-			end,
-
-		    %% The ConnPid process does a gen_server:reply() when
-		    %% it has an answer
-		    {noreply, NewState1}
-	    end;
-	nomatch ->
-	    %% we have no active connection matching PoolId
-	    {reply, {error, no_connection}, State}
-    end.
-
-%% Get a modified list of queries and set of prepared statements for
-%% the connection based on the set of prepared statements to be
-%% executed in this transaction. If the connection already has
-%% prepared all the statements, the original lists are returned.
-%% If the transaction contains a call to an undefined prepared statement,
-%% an error is returned.
-%%
-%% returns {NewQueryList, NewConnPrepares} or {error, Error}
-make_prepare_queries(State, QueryList, ConnPrepares, Prepares) ->
-    if Prepares == undefined ->
-	    {ok, {QueryList, ConnPrepares}};
-       true ->
-	    catch
-		lists:foldl(
-		  fun(StmtName, {ok, {QueryList1, ConnPrepares1}}) ->
-			  case gb_sets:is_element(StmtName, ConnPrepares) of
-			      true ->
-				  {ok, {QueryList1, ConnPrepares1}};
-			      false ->
-				  case find_statement(State, StmtName) of
-				      {ok, StmtBin} ->
-					  {ok, {[StmtBin | QueryList1],
-					   gb_sets:add_element(
-					     StmtName, ConnPrepares1)}};
-				      error ->
-					  throw({error,
-						 {unrecognized_statement,
-						  StmtName}})
-				  end
-			  end
-		  end, {ok, {QueryList, ConnPrepares}}, Prepares)
-	    end.
-
-make_statements_for_execute(StmtName, []) ->
-    StmtNameBin = encode(StmtName, true),
-    [<<"EXECUTE ", StmtNameBin/binary>>];
-make_statements_for_execute(StmtName, Params) ->
-    NumParams = length(Params),
-    ParamNums = lists:seq(1, NumParams),
-
-    StmtNameBin = encode(StmtName, true),
-    ParamNames =
-	lists:foldl(
-	  fun(Num, Acc) ->
-		  Name = "@" ++ integer_to_list(Num),
-		  if Num == 1 ->
-			  Name ++ Acc;
-		     true ->
-			  [$, | Name] ++ Acc
-		  end
-	  end, [], lists:reverse(ParamNums)),
-    ParamNamesBin = list_to_binary(ParamNames),
-
-    ExecStmt = <<"EXECUTE ", StmtNameBin/binary, " USING ",
-		ParamNamesBin/binary>>,
-
-    ParamVals = lists:zip(ParamNums, Params),
-    Stmts = lists:foldl(
-	      fun({Num, Val}, Acc) ->
-		      NumBin = encode(Num, true),
-		      ValBin = encode(Val, true),
-		      [<<"SET @", NumBin/binary, "=", ValBin/binary>> | Acc]
-	       end, [ExecStmt], ParamVals),
-    Stmts.
-
-handle_cast({prepare, StmtName, Statement}, State) ->
+handle_cast({prepare, Name, Stmt}, State) ->
     LogFun = State#state.log_fun,
+    Version1 =
+	case gb_trees:lookup(Name, State#state.prepares) of
+	    {value, {_Stmt, Version}} ->
+		Version + 1;
+	    none ->
+		1
+	end,
     ?Log2(LogFun, debug,
-	"received prepare/2: ~p ~p", [StmtName, Statement]),
-    StmtBin = if is_list(Statement) -> list_to_binary(Statement);
-		 true -> Statement
-	      end,
-    StmtNameBin = list_to_binary(atom_to_list(StmtName)),
-    StmtBin1 = <<"PREPARE ", StmtNameBin/binary, " FROM '",
-		StmtBin/binary, "'">>,
-    State1 = remove_prepare(State, StmtName, false),
-    {noreply, State1#state{prepares =
-			  gb_trees:enter(StmtName, StmtBin1,
-				     State1#state.prepares)}};
+	"received prepare/2: ~p (ver ~p) ~p", [Name, Version1, Stmt]),
+    {noreply, State#state{prepares =
+			  gb_trees:enter(Name, {Stmt, Version1},
+					  State#state.prepares)}};
 
-handle_cast({unprepare, StmtName}, State) ->
+handle_cast({unprepare, Name}, State) ->
     LogFun = State#state.log_fun,
-    ?Log2(LogFun, debug, "received unprepare/1: ~p", [StmtName]),
+    ?Log2(LogFun, debug, "received unprepare/1: ~p", [Name]),
+    State1 =
+	case gb_trees:lookup(Name, State#state.prepares) of
+	    none ->
+		?Log2(LogFun, warn, "trying to unprepare a non-existing "
+		      "statement: ~p", [Name]),
+		State;
+	    {value, _Stmt} ->
+		State#state{prepares =
+			    gb_trees:delete(Name, State#state.prepares)}
+	end,
+    {noreply, State1}.
 
-    {noreply, remove_prepare(State, StmtName, true)}.
-
-remove_prepare(State, StmtName, WarnIfMissing) ->
-    Prepares = State#state.prepares,
-    case catch gb_trees:delete(StmtName, Prepares) of
-	{'EXIT', _} ->
-	    if WarnIfMissing ->
-		    LogFun = State#state.log_fun,
-		    ?Log2(LogFun, warn, "tried to remove a non-existing "
-			  "statement ~p", [StmtName]);
-	       true ->
-		    ok
-	    end,
-	    State;
-	NewPrepares ->
-	    RemoveFun =
-		fun(Conn) ->
-			Conn#conn{prepares =
-				  gb_sets:delete_any(StmtName,
-						     Conn#conn.prepares)}
-		end,
-
-	    NewConnPools = 
-		lists:foldl(
-		  fun({PoolId, {Used, Unused}}, NewPools) ->
-			  gb_trees:enter(
-			    PoolId,
-			    {lists:map(RemoveFun,Used),
-			     lists:map(RemoveFun,Unused)},
-			    NewPools)
-		  end,
-		  gb_trees:empty(),
-		  gb_trees:to_list(State#state.conn_pools)),
-	    State#state{
-	      prepares = NewPrepares,
-	      conn_pools = NewConnPools}
-    end.
-			  
-find_statement(State, StmtName) ->
-    case gb_trees:lookup(StmtName, State#state.prepares) of
-	none ->
-	    LogFun = State#state.log_fun,
-	    ?Log2(LogFun, error,
-		  "received execute command for an unrecognized "
-		  "statement: ~p", [StmtName]),
-	    error;
-	{value, Val} ->
-	    {ok, Val}
-    end.
-
-%%--------------------------------------------------------------------
-%% Function: handle_info({'DOWN', ...}, State)
-%% Descrip.: Handle a message that one of our monitored processes
-%%           (mysql_conn processes in our connection list) has exited.
-%%           Remove the entry from our list.
-%% Returns : {noreply, NewState}   |
-%%           {stop, normal, State}
-%%           NewState = state record()
-%%
-%% Note    : For now, we stop if our connection list becomes empty.
-%%           We should try to reconnect for a while first, to not
-%%           eventually stop the whole OTP application if the MySQL-
-%%           server is shut down and the mysql_dispatcher was super-
-%%           vised by an OTP supervisor.
-%%--------------------------------------------------------------------
+%% Called when a connection to the database has been lost. If
+%% The 'reconnect' flag was set to true for the connection, we attempt
+%% to establish a new connection to the database.
 handle_info({'DOWN', _MonitorRef, process, Pid, Info}, State) ->
     LogFun = State#state.log_fun,
     case remove_conn(Pid, State) of
@@ -716,9 +535,47 @@ terminate(Reason, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%%====================================================================
+
 %% Internal functions
-%%====================================================================
+
+fetch_queries(PoolId, From, State, QueryList) ->
+    with_next_conn(
+      PoolId, State,
+      fun(Conn, State1) ->
+	      Pid = Conn#conn.pid,
+	      mysql_conn:fetch_queries(Pid, QueryList, From),
+	      {noreply, State1}
+      end).
+
+with_next_conn(PoolId, State, Fun) ->
+    case get_next_conn(PoolId, State) of
+	{ok, Conn, NewState} ->    
+	    Fun(Conn, NewState);
+	error ->
+	    %% we have no active connection matching PoolId
+	    {reply, {error, no_connection}, State}
+    end.
+
+in_transaction(Fun) ->
+    case get(?STATE_VAR) of
+	undefined ->
+	    {error, not_in_transaction};
+	State ->
+	    Fun(State)
+    end.
+
+if_in_transaction(Fun, Msg) ->
+    case get(?STATE_VAR) of
+	undefined ->
+	    if Timeout == undefined ->
+		    gen_server:call(?SERVER, Msg);
+	       true ->
+		    gen_server:call(?SERVER, Msg, Timeout)
+	    end;
+	State ->
+	    Fun(State)
+    end.
+
 
 add_conn(Conn, State) ->
     Pid = Conn#conn.pid,
@@ -737,30 +594,6 @@ add_conn(Conn, State) ->
 			       ConnPools),
 		pids_pools = gb_trees:enter(Pid, PoolId,
 					    State#state.pids_pools)}.
-
-replace_conn(Conn, State) ->
-    PoolId = Conn#conn.pool_id,
-    ConnPools = State#state.conn_pools,
-    {value, {Unused, Used}} = gb_trees:lookup(PoolId, ConnPools),
-    NewPool =
-	case replace_conn_in_list(Conn, Unused) of
-	    {Unused1, true} ->
-		{Unused1, Used};
-	    {_Unused1, false} ->
-		{Used1, true} = replace_conn_in_list(Conn, Used),
-		{Unused, Used1}
-	end,
-
-    State#state{conn_pools = gb_trees:enter(PoolId, NewPool,
-					    ConnPools)}.
-
-replace_conn_in_list(Conn, Conns) ->
-    lists:mapfoldl(
-      fun(Conn1, _Result) when Conn#conn.pid == Conn1#conn.pid ->
-	      {Conn, true};
-	 (Conn1, Result) ->
-	      {Conn1, Result}
-      end, false, Conns).
 
 remove_pid_from_list(Pid, Conns) ->
     lists:foldl(
@@ -810,12 +643,9 @@ get_next_conn(PoolId, State) ->
 	    error;
 	{value, {[],[]}} ->
 	    error;
-	
 	%% We maintain 2 lists: one for unused connections and one for used
 	%% connections. When we run out of unused connections, we recycle
-	%% the list of used connections. This is more efficient than
-	%% using one list and appending the last used connection to the end
-	%% of it every time, as the previous algorithm did.
+	%% the list of used connections.
 	{value, {[], Used}} ->
 	    [Conn | Conns] = lists:reverse(Used),
 	    {ok, Conn,
@@ -870,14 +700,10 @@ reconnect_loop(Conn, LogFun, N) ->
     end.
 
 
-%%--------------------------------------------------------------------
-%% Function: encode(Val, AsBinary)
-%%           Val = term()
-%%           AsBinary = true | false
-%% Descrip.: Encode a value so that it can be included safely in a
-%%           MySQL query.
-%% Returns : Encoded = string() | binary() | {error, Error}
-%%--------------------------------------------------------------------
+%% @doc Encode a value so that it can be included safely in a MySQL query.
+%%
+%% @spec encode(Val::term(), AsBinary::bool()) ->
+%%   string() | binary() | {error, Error}
 encode(Val) ->
     encode(Val, false).
 encode(Val, false) when Val == undefined; Val == null ->
@@ -915,14 +741,8 @@ encode({Time1, Time2, Time3}, false) ->
 encode(Val, _AsBinary) ->
     {error, {unrecognized_value, {Val}}}.
 
-%%--------------------------------------------------------------------
-%% Function: quote(Val)
-%%           Val = string() | binary()
-%% Descrip.: Quote a value so that it can be included safely in a
-%%           MySQL query. For most purposes, use encode/1 or encode/2
-%%           as it is more powerful.
-%% Returns : Quoted = string() | binary()
-%%--------------------------------------------------------------------
+%%  Quote a string or binary value so that it can be included safely in a
+%%  MySQL query.
 quote(String) when is_list(String) ->
     [39 | lists:reverse([39 | quote(String, [])])];	%% 39 is $'
 quote(Bin) when is_binary(Bin) ->
@@ -948,17 +768,11 @@ quote([C | Rest], Acc) ->
     quote(Rest, [C | Acc]).
 
 
-%%--------------------------------------------------------------------
-%% Function: asciz_binary(Data, Acc)
-%%           Data = binary()
-%%           Acc  = list(), input accumulator
-%% Descrip.: Find the first zero-byte in Data and add everything
-%%           before it to Acc, as a string.
-%% Returns : {NewList, Rest}
-%%           NewList = list(), Acc plus what we extracted from Data
-%%           Rest    = binary(), whatever was left of Data, not
-%%                     including the zero-byte
-%%--------------------------------------------------------------------
+%% @doc Find the first zero-byte in Data and add everything before it
+%%   to Acc, as a string.
+%%
+%% @spec asciz_binary(Data::binary(), Acc::list()) ->
+%%   {NewList::list(), Rest::binary()}
 asciz_binary(<<>>, Acc) ->
     {lists:reverse(Acc), <<>>};
 asciz_binary(<<0:8, Rest/binary>>, Acc) ->
