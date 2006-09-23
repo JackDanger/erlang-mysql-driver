@@ -220,9 +220,13 @@ fetch_local(State, Query) ->
     do_query(State, Query).
 
 execute_local(State, Name, Params) ->
-    ?L(Name),
-    ?L(Params),
-    do_execute(State, Name, Params, undefined).
+    case do_execute(State, Name, Params, undefined) of
+	{ok, Res, State1} ->
+	    put(?STATE_VAR, State1),
+	    Res;
+	Err ->
+	    Err
+    end.
 
 %%--------------------------------------------------------------------
 %% Function: do_recv(LogFun, RecvPid, SeqNum)
