@@ -45,37 +45,9 @@ test() ->
     
     S2 = <<"DELETE FROM developer WHERE name like 'Claes%'">>,
 
-    %% Create a transaction
-    T1 = mysql:new_transaction(p1),
-    T2 = mysql:add_query(T1, S1),
-    
-    %% You can execute prepared statements inside transactions
-    T3 = mysql:add_execute(T2, update_developer_country,
-			   [<<"Sweden">>, <<"%Armstrong">>]),
-
-    T4 = mysql:add_query(T3, S2),
-    mysql:commit(T4),
-
     Result3 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
     io:format("Result2: ~p~n", [Result3]),
     
-    %% Another way of doing a transaction
-    S3 = <<"DELETE FROM developer WHERE country='USA'">>,
-    mysql:transaction(p1, fun(T) ->
-				  mysql:add_queries(T, [S1,S2,S3])
-			  end),
-    
-    Result4 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
-    io:format("Result2: ~p~n", [Result4]),
-
-    %% Transactions are automatically rolled back if any of their queries
-    %% results in an error.
-    mysql:transaction(
-      p1, fun(T) ->
-		  mysql:add_queries(T, [<<"DELETE FROM developer">>,
-					<<"bad bad query">>])
-	  end),
-
     Result5 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
     io:format("Result2: ~p~n", [Result5]),
 				    
