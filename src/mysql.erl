@@ -539,7 +539,7 @@ fetch_queries(PoolId, From, State, QueryList) ->
       PoolId, State,
       fun(Conn, State1) ->
 	      Pid = Conn#conn.pid,
-	      mysql_conn:fetch_queries(Pid, QueryList, From),
+	      mysql_conn:fetch(Pid, QueryList, From),
 	      {noreply, State1}
       end).
 
