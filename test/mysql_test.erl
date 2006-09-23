@@ -39,17 +39,27 @@ test() ->
     Result2 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
     io:format("Result2: ~p~n", [Result2]),
     
-    %% Make some statements
-    S1 = <<"INSERT INTO developer(name, country) VALUES "
-	  "('Joe Armstrong', 'USA')">>,
-    
-    S2 = <<"DELETE FROM developer WHERE name like 'Claes%'">>,
+    mysql:transaction(
+      p1,
+      fun() -> mysql:fetch(<<"INSERT INTO developer(name, country) VALUES "
+			    "('Joe Armstrong', 'USA')">>),
+	       mysql:fetch(<<"DELETE FROM developer WHERE name like "
+			    "'Claes%'">>)
+      end),
 
     Result3 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
-    io:format("Result2: ~p~n", [Result3]),
+    io:format("Result3: ~p~n", [Result3]),
     
-    Result5 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
-    io:format("Result2: ~p~n", [Result5]),
+    mysql:prepare(delete_all, <<"DELETE FROM developer">>),
+
+    {error, foo} = mysql:transaction(
+		     p1,
+		     fun() -> mysql:execute(delete_all),
+			      throw({error, foo})
+		     end),
+
+    Result4 = mysql:fetch(p1, <<"SELECT * FROM developer">>),
+    io:format("Result4: ~p~n", [Result4]),
 				    
     ok.
     
