@@ -220,6 +220,8 @@ fetch_local(State, Query) ->
     do_query(State, Query).
 
 execute_local(State, Name, Params) ->
+    ?L(Name),
+    ?L(Params),
     do_execute(State, Name, Params, undefined).
 
 %%--------------------------------------------------------------------

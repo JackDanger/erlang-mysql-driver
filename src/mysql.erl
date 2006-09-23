@@ -81,10 +81,12 @@
 
 	 connect/7,
 
+	 fetch/1,
 	 fetch/2,
 	 fetch/3,
 	 
 	 prepare/2,
+	 execute/1,
 	 execute/2,
 	 execute/3,
 	 execute/4,
@@ -102,8 +104,7 @@
 
 	 encode/1,
 	 encode/2,
-	 asciz_binary/2,
-
+	 asciz_binary/2
 	]).
 
 %% Internal exports - just for mysql_* modules
@@ -203,10 +204,6 @@ start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
 
 
 
-get_state() ->
-    gen_server:call(?SERVER, get_state).
-
-
 %% @doc Fetch a query inside a transaction.
 %%
 %% @spec fetch(Query::iolist()) -> query_result()
@@ -231,7 +228,7 @@ fetch(PoolId, Query, Timeout) ->
       fun(State) ->
 	      mysql_conn:fetch_local(State, Query1)
       end,
-      {fetch, PoolId, Query1}).
+      {fetch, PoolId, Query1}, Timeout).
 
 %% @doc Register a prepared statement with the dispatcher. This call does not
 %%   prepare the statement in any connections. The statement is prepared
@@ -313,7 +310,8 @@ execute(PoolId, Name, Params, Timeout) ->
 		      Err
 	      end
       end,
-      {execute, PoolId, Name, Params}).
+      {execute, PoolId, Name, Params},
+     Timeout).
 
 %% @doc Execute a transaction in a connection belonging to the connection pool.
 %% Fun is a function containing a sequence of calls to fetch() and/or
@@ -417,8 +415,6 @@ init([PoolId, Host, Port, User, Password, Database, LogFun]) ->
 	    {stop, {error, Reason}}
     end.
 
-handle_call(get_state, _From, State) ->
-    {reply, State, State};
 handle_call({fetch, PoolId, Query}, From, State) ->
     fetch_queries(PoolId, From, State, [Query]);
 
@@ -564,7 +560,7 @@ in_transaction(Fun) ->
 	    Fun(State)
     end.
 
-if_in_transaction(Fun, Msg) ->
+if_in_transaction(Fun, Msg, Timeout) ->
     case get(?STATE_VAR) of
 	undefined ->
 	    if Timeout == undefined ->
