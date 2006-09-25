@@ -322,10 +322,12 @@ execute(PoolId, Name, Params, Timeout) ->
 %%
 %% @spec transaction(PoolId::atom(), Fun::function()) -> Result
 transaction(PoolId, Fun) ->
-    gen_server:call(?SERVER, {transaction, PoolId, Fun}).
+    transaction(PoolId, Fun, undefined).
 
 transaction(PoolId, Fun, Timeout) ->
-    gen_server:call(?SERVER, {transaction, PoolId, Fun}, Timeout).
+    if_in_transaction(
+      fun(_State) -> Fun() end,
+      {transaction, PoolId, Fun}, Timeout).
 
 %% @doc Extract the FieldInfo from MySQL Result on data received.
 %%
