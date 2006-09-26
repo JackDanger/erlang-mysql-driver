@@ -325,9 +325,17 @@ transaction(PoolId, Fun) ->
     transaction(PoolId, Fun, undefined).
 
 transaction(PoolId, Fun, Timeout) ->
+    Msg = {transaction, PoolId, Fun},
     if_in_transaction(
-      fun(_State) -> Fun() end,
-      {transaction, PoolId, Fun}, Timeout).
+      fun(State) ->
+	      case mysql_conn:get_pool_id(State) of
+		  PoolId ->
+		      Fun();
+		  _Other ->
+		      call_server(Msg, Timeout)
+	      end
+      end, Msg, Timeout).
+
 
 %% @doc Extract the FieldInfo from MySQL Result on data received.
 %%
@@ -366,7 +374,8 @@ connect(PoolId, Host, undefined, User, Password, Database, Reconnect) ->
     connect(PoolId, Host, ?PORT, User, Password, Database, Reconnect);
 connect(PoolId, Host, Port, User, Password, Database, Reconnect) ->
    {ok, LogFun} = gen_server:call(?SERVER, get_logfun),
-    case mysql_conn:start(Host, Port, User, Password, Database, LogFun) of
+    case mysql_conn:start(Host, Port, User, Password, Database, LogFun,
+			  PoolId) of
 	{ok, ConnPid} ->
 	    Conn = new_conn(PoolId, ConnPid, Reconnect, Host, Port, User,
 				 Password, Database),
@@ -404,7 +413,8 @@ new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database) ->
 
 init([PoolId, Host, Port, User, Password, Database, LogFun]) ->
     LogFun1 = if LogFun == undefined -> fun log/4; true -> LogFun end,
-    case mysql_conn:start(Host, Port, User, Password, Database, LogFun1) of
+    case mysql_conn:start(Host, Port, User, Password, Database, LogFun1,
+			  PoolId) of
 	{ok, ConnPid} ->
 	    Conn = new_conn(PoolId, ConnPid, true, Host, Port, User, Password,
 				 Database),
@@ -565,15 +575,17 @@ in_transaction(Fun) ->
 if_in_transaction(Fun, Msg, Timeout) ->
     case get(?STATE_VAR) of
 	undefined ->
-	    if Timeout == undefined ->
-		    gen_server:call(?SERVER, Msg);
-	       true ->
-		    gen_server:call(?SERVER, Msg, Timeout)
-	    end;
+	    call_server(Msg, Timeout);
 	State ->
 	    Fun(State)
     end.
 
+call_server(Msg, Timeout) ->
+    if Timeout == undefined ->
+	    gen_server:call(?SERVER, Msg);
+       true ->
+	    gen_server:call(?SERVER, Msg, Timeout)
+    end.
 
 add_conn(Conn, State) ->
     Pid = Conn#conn.pid,

@@ -70,8 +70,8 @@
 %%--------------------------------------------------------------------
 %% External exports
 %%--------------------------------------------------------------------
--export([start/6,
-	 start_link/6,
+-export([start/7,
+	 start_link/7,
 	 fetch/3,
 	 fetch/4,
 	 execute/5,
@@ -82,7 +82,9 @@
 
 %% private exports to be called only from the 'mysql' module
 -export([fetch_local/2,
-	 execute_local/3]).
+	 execute_local/3,
+	 get_pool_id/1
+	]).
 
 %%--------------------------------------------------------------------
 %% External exports (should only be used by the 'mysql_auth' module)
@@ -97,7 +99,12 @@
 	  recv_pid,
 	  socket,
 	  data,
-	  prepares = gb_trees:empty() %% maps statement names to their versions
+
+	  %% maps statement names to their versions
+	  prepares = gb_trees:empty(),
+
+	  %% the id of the connection pool to which this connection belongs
+	  pool_id
 	 }).
 
 -define(SECURE_CONNECTION, 32768).
@@ -136,19 +143,19 @@
 %%           Pid    = pid()
 %%           Reason = string()
 %%--------------------------------------------------------------------
-start(Host, Port, User, Password, Database, LogFun) ->
+start(Host, Port, User, Password, Database, LogFun, PoolId) ->
     ConnPid = self(),
     Pid = spawn(fun () ->
 			init(Host, Port, User, Password, Database,
-			     LogFun, ConnPid)
+			     LogFun, PoolId, ConnPid)
 		end),
     post_start(Pid, LogFun).
 
-start_link(Host, Port, User, Password, Database, LogFun) ->
+start_link(Host, Port, User, Password, Database, LogFun, PoolId) ->
     ConnPid = self(),
     Pid = spawn_link(fun () ->
 			     init(Host, Port, User, Password, Database,
-				  LogFun, ConnPid)
+				  LogFun, PoolId, ConnPid)
 		     end),
     post_start(Pid, LogFun).
 
@@ -211,6 +218,9 @@ transaction(Pid, Fun, From) ->
 
 transaction(Pid, Fun, From, Timeout) ->
     send_msg(Pid, {transaction, Fun, From}, From, Timeout).
+
+get_pool_id(State) ->
+    State#state.pool_id.
 
 %%====================================================================
 %% Internal functions
@@ -299,7 +309,7 @@ send_msg(Pid, Msg, From, Timeout) ->
 %%           we were successfull.
 %% Returns : void() | does not return
 %%--------------------------------------------------------------------
-init(Host, Port, User, Password, Database, LogFun, Parent) ->
+init(Host, Port, User, Password, Database, LogFun, PoolId, Parent) ->
     case mysql_recv:start_link(Host, Port, LogFun, self()) of
 	{ok, RecvPid, Sock} ->
 	    case mysql_init(Sock, RecvPid, User, Password, LogFun) of
@@ -324,6 +334,7 @@ init(Host, Port, User, Password, Database, LogFun, Parent) ->
 					   recv_pid = RecvPid,
 					   socket   = Sock,
 					   log_fun  = LogFun,
+					   pool_id  = PoolId,
 					   data     = <<>>
 					  },
 			    loop(State)
