@@ -464,7 +464,7 @@ do_transaction(State, Fun) ->
 			{error, _} = Err ->
 			    rollback(State, {commit_error, Err});
 			_ ->
-			    Res
+			    {atomic, Res}
 		    end
 	    end
     end.

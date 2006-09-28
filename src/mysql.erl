@@ -325,11 +325,9 @@ execute(PoolId, Name, Params, Timeout) ->
 %% - exit(Reason)
 %%
 %% the transaction is automatically rolled back.
-%% The return value of this call is the return value of the Fun, or
-%% {aborted, Details}.
 %%
 %% @spec transaction(PoolId::atom(), Fun::function()) ->
-%%   Result | {aborted, {Reason, {rollback_result, Result}}}
+%%   {atomic, Result} | {aborted, {Reason, {rollback_result, Result}}}
 transaction(PoolId, Fun) ->
     transaction(PoolId, Fun, undefined).
 
@@ -339,7 +337,11 @@ transaction(PoolId, Fun, Timeout) ->
       fun(State) ->
 	      case mysql_conn:get_pool_id(State) of
 		  PoolId ->
-		      Fun();
+		      case Fun() of
+			  error = Err -> throw(Err);
+			  {error, _} = Err -> throw(Err);
+			  Res -> Res
+		      end;
 		  _Other ->
 		      call_server(Msg, Timeout)
 	      end
