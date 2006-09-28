@@ -316,11 +316,20 @@ execute(PoolId, Name, Params, Timeout) ->
 %% @doc Execute a transaction in a connection belonging to the connection pool.
 %% Fun is a function containing a sequence of calls to fetch() and/or
 %% execute().
-%% If this function returns {error, Err} or if it throws an exception
-%% of type {error, Err}, the transaction is automatically rolled back.
-%% The return value of this call is the return value of the Fun.
+%% If an error occurs, or if the function does any of the following:
 %%
-%% @spec transaction(PoolId::atom(), Fun::function()) -> Result
+%% - throw(error)
+%% - throw({error, Err})
+%% - return error
+%% - return {error, Err}
+%% - exit(Reason)
+%%
+%% the transaction is automatically rolled back.
+%% The return value of this call is the return value of the Fun, or
+%% {aborted, Details}.
+%%
+%% @spec transaction(PoolId::atom(), Fun::function()) ->
+%%   Result | {aborted, {Reason, {rollback_result, Result}}}
 transaction(PoolId, Fun) ->
     transaction(PoolId, Fun, undefined).
 

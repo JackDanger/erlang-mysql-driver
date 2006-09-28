@@ -451,23 +451,27 @@ do_queries(Sock, RecvPid, LogFun, Queries, Version) ->
 	  end, ok, Queries).
 
 do_transaction(State, Fun) ->
-      case do_query(State, <<"BEGIN">>) of
+    case do_query(State, <<"BEGIN">>) of
  	{error, _} = Err ->	
- 	    Err;
+ 	    {aborted, Err};
  	_ ->
-	      case catch Fun() of
-		  {error, _} = Err ->
-		      do_query(State, <<"ROLLBACK">>),
-		      Err;
-		  Res ->
-		      case do_query(State, <<"COMMIT">>) of
-			  {error, _} = Err ->
-			      Err;
-			  _ ->
-			      Res
-		      end
-	      end
-      end.
+	    case catch Fun() of
+		error = Err -> rollback(State, Err);
+		{error, _} = Err -> rollback(State, Err);
+		{'EXIT', _} = Err -> rollback(State, Err);
+		Res ->
+		    case do_query(State, <<"COMMIT">>) of
+			{error, _} = Err ->
+			    rollback(State, {commit_error, Err});
+			_ ->
+			    Res
+		    end
+	    end
+    end.
+
+rollback(State, Err) ->
+    Res = do_query(State, <<"ROLLBACK">>),
+    {aborted, {Err, {rollback_result, Res}}}.
 
 do_execute(State, Name, Params, ExpectedVersion) ->
     Res = case gb_trees:lookup(Name, State#state.prepares) of
