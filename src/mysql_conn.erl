@@ -580,8 +580,7 @@ mysql_init(Sock, RecvPid, User, Password, LogFun) ->
 		{ok, <<0:8, _Rest/binary>>, _RecvNum} ->
 		    {ok,Version};
 		{ok, <<255:8, Code:16/little, Message/binary>>, _RecvNum} ->
-		    ?Log2(LogFun, error,
-			 "init error ~p: ~p",
+		    ?Log2(LogFun, error, "init error ~p: ~p",
 			 [Code, binary_to_list(Message)]),
 		    {error, binary_to_list(Message)};
 		{ok, RecvPacket, _RecvNum} ->
