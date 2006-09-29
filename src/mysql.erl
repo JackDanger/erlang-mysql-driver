@@ -210,7 +210,7 @@ start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
 fetch(Query) ->
     in_transaction(
       fun(State) ->
-	      mysql_conn:fetch_local(State, iolist_to_binary(Query))
+	      mysql_conn:fetch_local(State, Query)
       end).
 
 %% @doc Send a query to a connection from the connection pool and wait
@@ -223,12 +223,11 @@ fetch(PoolId, Query) ->
     fetch(PoolId, Query, undefined).
 
 fetch(PoolId, Query, Timeout) -> 
-    Query1 = iolist_to_binary(Query),
     if_in_transaction(
       fun(State) ->
-	      mysql_conn:fetch_local(State, Query1)
+	      mysql_conn:fetch_local(State, Query)
       end,
-      {fetch, PoolId, Query1}, Timeout).
+      {fetch, PoolId, Query}, Timeout).
 
 %% @doc Register a prepared statement with the dispatcher. This call does not
 %%   prepare the statement in any connections. The statement is prepared
@@ -240,7 +239,7 @@ fetch(PoolId, Query, Timeout) ->
 %%
 %% @spec prepare(Name::atom(), Query::iolist()) -> ok
 prepare(Name, Query) ->
-    gen_server:cast(?SERVER, {prepare, Name, iolist_to_binary(Query)}).
+    gen_server:cast(?SERVER, {prepare, Name, Query}).
 
 %% @doc Unregister a statement that has previously been register with
 %%   the dispatcher. All calls to execute() with the given statement

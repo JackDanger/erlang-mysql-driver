@@ -414,8 +414,9 @@ do_query(State, Query) ->
 	      ).
 
 do_query(Sock, RecvPid, LogFun, Query, Version) ->
-    ?Log2(LogFun, debug, "fetch ~p (id ~p)", [Query,RecvPid]),
-    Packet =  <<?MYSQL_QUERY_OP, Query/binary>>,
+    Query1 = iolist_to_binary(Query),
+    ?Log2(LogFun, debug, "fetch ~p (id ~p)", [Query1,RecvPid]),
+    Packet =  <<?MYSQL_QUERY_OP, Query1/binary>>,
     case do_send(Sock, Packet, 0, LogFun) of
 	ok ->
 	    get_query_response(LogFun,RecvPid,
@@ -505,7 +506,6 @@ prepare_and_exec(State, Name, Version, Stmt, Params) ->
 	{error, _} = Err ->
 	    Err;
 	Other ->
-	    ?L(Other),
 	    {error, foo}
     end.
 
@@ -845,6 +845,7 @@ get_field_datatype(11) ->  'TIME';
 get_field_datatype(12) ->  'DATETIME';
 get_field_datatype(13) ->  'YEAR';
 get_field_datatype(14) ->  'NEWDATE';
+get_field_datatype(246) -> 'NEWDECIMAL';
 get_field_datatype(247) -> 'ENUM';
 get_field_datatype(248) -> 'SET';
 get_field_datatype(249) -> 'TINYBLOB';
@@ -878,6 +879,7 @@ convert_type(Val, ColType) ->
 		io_lib:fread("~d-~d-~d", binary_to_list(Val)),
 	    {date, {Year, Month, Day}};
 	T when T == 'DECIMAL';
+	       T == 'NEWDECIMAL';
 	       T == 'FLOAT';
 	       T == 'DOUBLE' ->
 	    {ok, [Num], _Leftovers} =
