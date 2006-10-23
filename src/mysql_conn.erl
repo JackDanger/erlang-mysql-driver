@@ -505,7 +505,7 @@ prepare_and_exec(State, Name, Version, Stmt, Params) ->
 	    {ok, do_execute1(State1, Name, Params), State1};
 	{error, _} = Err ->
 	    Err;
-	Other ->
+	_Other ->
 	    {error, foo}
     end.
 
