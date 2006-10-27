@@ -384,7 +384,7 @@ connect(PoolId, Host, undefined, User, Password, Database, Reconnect) ->
     connect(PoolId, Host, ?PORT, User, Password, Database, Reconnect);
 connect(PoolId, Host, Port, User, Password, Database, Reconnect) ->
    {ok, LogFun} = gen_server:call(?SERVER, get_logfun),
-    case mysql_conn:start(Host, Port, User, Password, Database, LogFun,
+    case mysql_conn:start_link(Host, Port, User, Password, Database, LogFun,
 			  PoolId) of
 	{ok, ConnPid} ->
 	    Conn = new_conn(PoolId, ConnPid, Reconnect, Host, Port, User,
@@ -748,18 +748,26 @@ encode(Val, false) when is_float(Val) ->
 encode({datetime, Val}, AsBinary) ->
     encode(Val, AsBinary);
 encode({{Year, Month, Day}, {Hour, Minute, Second}}, false) ->
-    Res = io_lib:format("'~B~B~B~B~B~B'", [Year, Month, Day, Hour,
-					  Minute, Second]),
+    Res = two_digits([Year, Month, Day, Hour, Minute, Second]),
     lists:flatten(Res);
 encode({TimeType, Val}, AsBinary)
   when TimeType == 'date';
        TimeType == 'time' ->
     encode(Val, AsBinary);
 encode({Time1, Time2, Time3}, false) ->
-    Res = io_lib:format("'~B~B~B'", [Time1, Time2, Time3]),
+    Res = two_digits([Time1, Time2, Time3]),
     lists:flatten(Res);
 encode(Val, _AsBinary) ->
     {error, {unrecognized_value, {Val}}}.
+
+two_digits(Nums) when is_list(Nums) ->
+    [two_digits(Num) || Num <- Nums];
+two_digits(Num) ->
+    [Str] = io_lib:format("~b", [Num]),
+    case length(Str) of
+	1 -> [$0 | Str];
+	_ -> Str
+    end.
 
 %%  Quote a string or binary value so that it can be included safely in a
 %%  MySQL query.

@@ -770,7 +770,7 @@ get_row([Field | OtherFields], Data, Res) ->
     {Col, Rest} = get_with_length(Data),
     This = case Col of
 	       null ->
-		   null;
+		   undefined;
 	       _ ->
 		   convert_type(Col, element(4, Field))
 	   end,
@@ -892,4 +892,4 @@ convert_type(Val, ColType) ->
 	_Other ->
 	    Val
     end.
-
+	    
