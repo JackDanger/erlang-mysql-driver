@@ -121,7 +121,7 @@
 	LogFun(?MODULE, ?LINE,Level,fun()-> {Msg,[]} end)).
 -define(Log2(LogFun,Level,Msg,Params),
 	LogFun(?MODULE, ?LINE,Level,fun()-> {Msg,Params} end)).
--define(L(Obj), io:format("LOG ~w ~p\n", [?LINE, Obj])).
+-define(L(Msg), io:format("~p:~b ~p ~n", [?MODULE, ?LINE, Msg])).
 
 
 %%====================================================================
@@ -465,7 +465,10 @@ do_transaction(State, Fun) ->
 			{error, _} = Err ->
 			    rollback(State, {commit_error, Err});
 			_ ->
-			    {atomic, Res}
+			    case Res of
+				{atomic, _} -> Res;
+				_ -> {atomic, Res}
+			    end
 		    end
 	    end
     end.
@@ -505,8 +508,8 @@ prepare_and_exec(State, Name, Version, Stmt, Params) ->
 	    {ok, do_execute1(State1, Name, Params), State1};
 	{error, _} = Err ->
 	    Err;
-	_Other ->
-	    {error, foo}
+	Other ->
+	    {error, {unexpected_result, Other}}
     end.
 
 do_execute1(State, Name, Params) ->

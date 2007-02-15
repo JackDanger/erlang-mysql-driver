@@ -161,8 +161,7 @@
 -define(PORT, 3306).
 
 %% used for debugging
--define(L(Obj), io:format("LOG ~w ~p\n", [?LINE, Obj])).
-
+-define(L(Msg), io:format("~p:~b ~p ~n", [?MODULE, ?LINE, Msg])).
 
 %% Log messages are designed to instantiated lazily only if the logging level
 %% permits a log message to be logged
@@ -208,10 +207,12 @@ start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
 %%
 %% @spec fetch(Query::iolist()) -> query_result()
 fetch(Query) ->
-    in_transaction(
-      fun(State) ->
-	      mysql_conn:fetch_local(State, Query)
-      end).
+    case get(?STATE_VAR) of
+	undefined ->
+	    {error, not_in_transaction};
+	State ->
+	    mysql_conn:fetch_local(State, Query)
+    end.
 
 %% @doc Send a query to a connection from the connection pool and wait
 %%   for the result. If this function is called inside a transaction,
@@ -223,11 +224,13 @@ fetch(PoolId, Query) ->
     fetch(PoolId, Query, undefined).
 
 fetch(PoolId, Query, Timeout) -> 
-    if_in_transaction(
-      fun(State) ->
-	      mysql_conn:fetch_local(State, Query)
-      end,
-      {fetch, PoolId, Query}, Timeout).
+    case get(?STATE_VAR) of
+	undefined ->
+	    call_server({fetch, PoolId, Query}, Timeout);
+	State ->
+	    mysql_conn:fetch_local(State, Query)
+    end.
+
 
 %% @doc Register a prepared statement with the dispatcher. This call does not
 %%   prepare the statement in any connections. The statement is prepared
@@ -276,10 +279,12 @@ execute(Name) ->
     execute(Name, []).
 
 execute(Name, Params) when is_atom(Name), is_list(Params) ->
-    in_transaction(
-      fun(State) ->
-	      mysql_conn:execute_local(State, Name, Params)
-      end);
+    case get(?STATE_VAR) of
+	undefined ->
+	    {error, not_in_transaction};
+	State ->
+	    mysql_conn:execute_local(State, Name, Params)
+    end;
 
 %% @doc Execute a query in the connection pool identified by
 %% PoolId. This function optionally accepts a list of parameters to pass
@@ -299,8 +304,10 @@ execute(PoolId, Name, Params) when is_list(Params) ->
     execute(PoolId, Name, Params, undefined).
 
 execute(PoolId, Name, Params, Timeout) ->
-    if_in_transaction(
-      fun(State) ->
+    case get(?STATE_VAR) of
+	undefined ->
+	    call_server({execute, PoolId, Name, Params}, Timeout);
+	State ->
 	      case mysql_conn:execute_local(State, Name, Params) of
 		  {ok, Res, NewState} ->
 		      put(?STATE_VAR, NewState),
@@ -308,9 +315,7 @@ execute(PoolId, Name, Params, Timeout) ->
 		  Err ->
 		      Err
 	      end
-      end,
-      {execute, PoolId, Name, Params},
-     Timeout).
+    end.
 
 %% @doc Execute a transaction in a connection belonging to the connection pool.
 %% Fun is a function containing a sequence of calls to fetch() and/or
@@ -331,21 +336,22 @@ transaction(PoolId, Fun) ->
     transaction(PoolId, Fun, undefined).
 
 transaction(PoolId, Fun, Timeout) ->
-    Msg = {transaction, PoolId, Fun},
-    if_in_transaction(
-      fun(State) ->
-	      case mysql_conn:get_pool_id(State) of
-		  PoolId ->
-		      case Fun() of
-			  error = Err -> throw(Err);
-			  {error, _} = Err -> throw(Err);
-			  Res -> Res
-		      end;
-		  _Other ->
-		      call_server(Msg, Timeout)
-	      end
-      end, Msg, Timeout).
-
+    case get(?STATE_VAR) of
+	undefined ->
+	    call_server({transaction, PoolId, Fun}, Timeout);
+	State ->
+	    case mysql_conn:get_pool_id(State) of
+		PoolId ->
+		    case catch Fun() of
+			error = Err -> throw(Err);
+			{error, _} = Err -> throw(Err);
+			{'EXIT', _} = Err -> throw(Err);
+			Other -> {atomic, Other}
+		    end;
+		_Other ->
+		    call_server({transaction, PoolId, Fun}, Timeout)
+	    end
+    end.
 
 %% @doc Extract the FieldInfo from MySQL Result on data received.
 %%
@@ -396,8 +402,8 @@ connect(PoolId, Host, Port, User, Password, Database, Reconnect) ->
 		Res ->
 		    Res
 	    end;
-	{error, Reason} ->
-	    {error, Reason}
+	Err->
+	    Err
     end.
 
 new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database) ->
@@ -534,7 +540,6 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Info}, State) ->
 		    ok
 	    end,
 	    {noreply, NewState};
-
 	error ->
 	    ?Log2(LogFun, error,
 		  "received 'DOWN' signal from pid ~p not in my list", [Pid]),
@@ -571,23 +576,7 @@ with_next_conn(PoolId, State, Fun) ->
 	    Fun(Conn, NewState);
 	error ->
 	    %% we have no active connection matching PoolId
-	    {reply, {error, no_connection}, State}
-    end.
-
-in_transaction(Fun) ->
-    case get(?STATE_VAR) of
-	undefined ->
-	    {error, not_in_transaction};
-	State ->
-	    Fun(State)
-    end.
-
-if_in_transaction(Fun, Msg, Timeout) ->
-    case get(?STATE_VAR) of
-	undefined ->
-	    call_server(Msg, Timeout);
-	State ->
-	    Fun(State)
+	    {reply, {error, {no_connection_in_pool, PoolId}}, State}
     end.
 
 call_server(Msg, Timeout) ->
@@ -626,7 +615,6 @@ remove_pid_from_list(Pid, Conns) ->
 	 (OtherConn, {NewConns, FoundConn}) ->
 	      {[OtherConn|NewConns], FoundConn}
       end, {[],undefined}, lists:reverse(Conns)).
-		  
 
 remove_pid_from_lists(Pid, Conns1, Conns2) ->
     case remove_pid_from_list(Pid, Conns1) of
@@ -714,8 +702,8 @@ reconnect_loop(Conn, LogFun, N) ->
 		       _ ->
 			   N + 1
 		   end,
-	    %% sleep between every unsuccessfull attempt
-	    timer:sleep(20 * 1000),
+	    %% sleep between every unsuccessful attempt
+	    timer:sleep(5 * 1000),
 	    reconnect_loop(Conn, LogFun, NewN)
     end.
 
@@ -758,7 +746,7 @@ encode({Time1, Time2, Time3}, false) ->
     Res = two_digits([Time1, Time2, Time3]),
     lists:flatten(Res);
 encode(Val, _AsBinary) ->
-    {error, {unrecognized_value, {Val}}}.
+    {error, {unrecognized_value, Val}}.
 
 two_digits(Nums) when is_list(Nums) ->
     [two_digits(Num) || Num <- Nums];
@@ -807,4 +795,3 @@ asciz_binary(<<0:8, Rest/binary>>, Acc) ->
     {lists:reverse(Acc), Rest};
 asciz_binary(<<C:8, Rest/binary>>, Acc) ->
     asciz_binary(Rest, [C | Acc]).
-
