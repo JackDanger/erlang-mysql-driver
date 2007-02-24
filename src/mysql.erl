@@ -28,6 +28,8 @@
 %%%   start_link(PoolId, Host, User, Password, Database, LogFun)
 %%%   start_link(PoolId, Host, Port, User, Password, Database, LogFun)
 %%%
+%%% (These functions also have non-linking coutnerparts.)
+%%%
 %%% PoolId is a connection pool identifier. If you want to have more
 %%% than one connection to a server (or a set of MySQL replicas),
 %%% add more with
@@ -78,6 +80,10 @@
 -export([start_link/5,
 	 start_link/6,
 	 start_link/7,
+
+	 start/5,
+	 start/6,
+	 start/7,
 
 	 connect/7,
 
@@ -187,7 +193,7 @@ log(Module, Line, _Level, FormatFun) ->
 %%   LogFun::undefined | function() of arity 4) ->
 %%     {ok, Pid} | ignore | {error, Err}
 start_link(PoolId, Host, User, Password, Database) ->
-    start_link(PoolId, Host, ?PORT, User, Password, Database, undefined).
+    start_link(PoolId, Host, ?PORT, User, Password, Database).
 
 start_link(PoolId, Host, Port, User, Password, Database) ->
     start_link(PoolId, Host, Port, User, Password, Database, undefined).
@@ -196,8 +202,27 @@ start_link(PoolId, Host, undefined, User, Password, Database, LogFun) ->
     start_link(PoolId, Host, ?PORT, User, Password, Database, LogFun);
 
 start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
+    start1(PoolId, Host, Port, User, Password, Database, LogFun,
+	       start_link).
+
+%% @doc These functions are similar to their start_link counterparts,
+%% but they call gen_server:start() instead of gen_server:start_link()
+start(PoolId, Host, User, Password, Database) ->
+    start(PoolId, Host, ?PORT, User, Password, Database).
+
+start(PoolId, Host, Port, User, Password, Database) ->
+    start(PoolId, Host, Port, User, Password, Database, undefined).
+
+start(PoolId, Host, undefined, User, Password, Database, LogFun) ->
+    start(PoolId, Host, ?PORT, User, Password, Database, LogFun);
+
+start(PoolId, Host, Port, User, Password, Database, LogFun) ->
+    start1(PoolId, Host, Port, User, Password, Database, LogFun,
+	   start).
+
+start1(PoolId, Host, Port, User, Password, Database, LogFun, StartFunc) ->
     crypto:start(),
-    gen_server:start_link(
+    gen_server:StartFunc(
       {local, ?SERVER}, ?MODULE,
       [PoolId, Host, Port, User, Password, Database, LogFun], []).
 
