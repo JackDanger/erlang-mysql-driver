@@ -70,8 +70,8 @@
 %%--------------------------------------------------------------------
 %% External exports
 %%--------------------------------------------------------------------
--export([start/7,
-	 start_link/7,
+-export([start/8,
+	 start_link/8,
 	 fetch/3,
 	 fetch/4,
 	 execute/5,
@@ -143,19 +143,19 @@
 %%           Pid    = pid()
 %%           Reason = string()
 %%--------------------------------------------------------------------
-start(Host, Port, User, Password, Database, LogFun, PoolId) ->
+start(Host, Port, User, Password, Database, LogFun, Encoding, PoolId) ->
     ConnPid = self(),
     Pid = spawn(fun () ->
 			init(Host, Port, User, Password, Database,
-			     LogFun, PoolId, ConnPid)
+			     LogFun, Encoding, PoolId, ConnPid)
 		end),
     post_start(Pid, LogFun).
 
-start_link(Host, Port, User, Password, Database, LogFun, PoolId) ->
+start_link(Host, Port, User, Password, Database, LogFun, Encoding, PoolId) ->
     ConnPid = self(),
     Pid = spawn_link(fun () ->
 			     init(Host, Port, User, Password, Database,
-				  LogFun, PoolId, ConnPid)
+				  LogFun, Encoding, PoolId, ConnPid)
 		     end),
     post_start(Pid, LogFun).
 
@@ -309,7 +309,7 @@ send_msg(Pid, Msg, From, Timeout) ->
 %%           we were successfull.
 %% Returns : void() | does not return
 %%--------------------------------------------------------------------
-init(Host, Port, User, Password, Database, LogFun, PoolId, Parent) ->
+init(Host, Port, User, Password, Database, LogFun, Encoding, PoolId, Parent) ->
     case mysql_recv:start_link(Host, Port, LogFun, self()) of
 	{ok, RecvPid, Sock} ->
 	    case mysql_init(Sock, RecvPid, User, Password, LogFun) of
@@ -330,6 +330,14 @@ init(Host, Port, User, Password, Database, LogFun, PoolId, Parent) ->
 			%% ResultType: data | updated
 			{_ResultType, _MySQLRes} ->
 			    Parent ! {mysql_conn, self(), ok},
+			    case Encoding of
+				undefined -> undefined;
+				_ ->
+				    EncodingBinary = list_to_binary(atom_to_list(Encoding)),
+				    do_query(Sock, RecvPid, LogFun,
+					     <<"set names '", EncodingBinary/binary, "'">>,
+					     Version)
+			    end,
 			    State = #state{mysql_version=Version,
 					   recv_pid = RecvPid,
 					   socket   = Sock,
