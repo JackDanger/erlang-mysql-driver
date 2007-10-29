@@ -89,6 +89,7 @@
 
 	 connect/7,
 	 connect/8,
+	 connect/9,
 
 	 fetch/1,
 	 fetch/2,
@@ -200,17 +201,23 @@ start_link(PoolId, Host, User, Password, Database) ->
     start_link(PoolId, Host, ?PORT, User, Password, Database).
 
 start_link(PoolId, Host, Port, User, Password, Database) ->
-    start_link(PoolId, Host, Port, User, Password, Database, undefined, undefined).
+    start_link(PoolId, Host, Port, User, Password, Database, undefined,
+	       undefined).
 
 start_link(PoolId, Host, undefined, User, Password, Database, LogFun) ->
-    start_link(PoolId, Host, ?PORT, User, Password, Database, LogFun, undefined);
+    start_link(PoolId, Host, ?PORT, User, Password, Database, LogFun,
+	       undefined);
 start_link(PoolId, Host, Port, User, Password, Database, LogFun) ->
-    start_link(PoolId, Host, Port, User, Password, Database, LogFun, undefined).
+    start_link(PoolId, Host, Port, User, Password, Database, LogFun,
+	       undefined).
 
-start_link(PoolId, Host, undefined, User, Password, Database, LogFun, Encoding) ->
-    start1(PoolId, Host, ?PORT, User, Password, Database, LogFun, Encoding, start_link);
+start_link(PoolId, Host, undefined, User, Password, Database, LogFun,
+	   Encoding) ->
+    start1(PoolId, Host, ?PORT, User, Password, Database, LogFun, Encoding,
+	   start_link);
 start_link(PoolId, Host, Port, User, Password, Database, LogFun, Encoding) ->
-    start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding, start_link).
+    start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding,
+	   start_link).
 
 %% @doc These functions are similar to their start_link counterparts,
 %% but they call gen_server:start() instead of gen_server:start_link()
@@ -226,17 +233,78 @@ start(PoolId, Host, Port, User, Password, Database, LogFun) ->
     start(PoolId, Host, Port, User, Password, Database, LogFun, undefined).
 
 start(PoolId, Host, undefined, User, Password, Database, LogFun, Encoding) ->
-    start1(PoolId, Host, ?PORT, User, Password, Database, LogFun, Encoding, start);
+    start1(PoolId, Host, ?PORT, User, Password, Database, LogFun, Encoding,
+	   start);
 start(PoolId, Host, Port, User, Password, Database, LogFun, Encoding) ->
-    start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding, start).
+    start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding,
+	   start).
 
-start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding, StartFunc) ->
+start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding,
+       StartFunc) ->
     crypto:start(),
     gen_server:StartFunc(
       {local, ?SERVER}, ?MODULE,
       [PoolId, Host, Port, User, Password, Database, LogFun, Encoding], []).
 
 
+%% @equiv connect(PoolId, Host, Port, User, Password, Database, Encoding,
+%%	   Reconnect, true)
+connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect) ->
+    connect(PoolId, Host, Port, User, Password, Database, Encoding,
+	    Reconnect, true).
+
+%% @doc Starts a MySQL connection and, if successful, add it to the
+%%   connection pool in the dispatcher.
+%%
+%% @spec: connect(PoolId::atom(), Host::string(), Port::integer() | undefined,
+%%    User::string(), Password::string(), Database::string(),
+%%    Encoding::string(), Reconnect::bool(), LinkConnection::bool()) ->
+%%      {ok, ConnPid} | {error, Reason}
+connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect,
+       LinkConnection) ->
+    Port1 = if Port == undefined -> ?PORT; true -> Port end,
+    Fun = if LinkConnection ->
+		  fun mysql_conn:start_link/8;
+	     true ->
+		  fun mysql_conn:start/8
+	  end,
+
+   {ok, LogFun} = gen_server:call(?SERVER, get_logfun),
+    case Fun(Host, Port1, User, Password, Database, LogFun,
+	     Encoding, PoolId) of
+	{ok, ConnPid} ->
+	    Conn = new_conn(PoolId, ConnPid, Reconnect, Host, Port1, User,
+			    Password, Database, Encoding),
+	    case gen_server:call(
+		   ?SERVER, {add_conn, Conn}) of
+		ok ->
+		    {ok, ConnPid};
+		Res ->
+		    Res
+	    end;
+	Err->
+	    Err
+    end.
+
+new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database,
+	 Encoding) ->
+    case Reconnect of
+	true ->
+	    #conn{pool_id = PoolId,
+		  pid = ConnPid,
+		  reconnect = true,
+		  host = Host,
+		  port = Port,
+		  user = User,
+		  password = Password,
+		  database = Database,
+		  encoding = Encoding
+		 };
+	false ->                        
+	    #conn{pool_id = PoolId,
+		  pid = ConnPid,
+		  reconnect = false}
+    end.
 
 %% @doc Fetch a query inside a transaction.
 %%
@@ -416,53 +484,8 @@ get_result_reason(#mysql_result{error=Reason}) ->
     Reason.
 
 connect(PoolId, Host, undefined, User, Password, Database, Reconnect) ->
-    connect(PoolId, Host, ?PORT, User, Password, Database, undefined, Reconnect).
-
-%% @doc Starts a MySQL connection and, if successful, add it to the
-%%   connection pool in the dispatcher.
-%%
-%% @spec: connect(PoolId::atom(), Host::string(), Port::integer() | undefined,
-%%    User::string(), Password::string(), Database::string(),
-%%    Reconnect::bool()) -> {ok, ConnPid} | {error, Reason}
-connect(PoolId, Host, undefined, User, Password, Database, Encoding, Reconnect) ->
-    connect(PoolId, Host, ?PORT, User, Password, Database, Encoding, Reconnect);
-connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect) ->
-   {ok, LogFun} = gen_server:call(?SERVER, get_logfun),
-    case mysql_conn:start_link(Host, Port, User, Password, Database, LogFun,
-			       Encoding, PoolId) of
-	{ok, ConnPid} ->
-	    Conn = new_conn(PoolId, ConnPid, Reconnect, Host, Port, User,
-			    Password, Database, Encoding),
-	    case gen_server:call(
-		   ?SERVER, {add_conn, Conn}) of
-		ok ->
-		    {ok, ConnPid};
-		Res ->
-		    Res
-	    end;
-	Err->
-	    Err
-    end.
-
-new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database, Encoding) ->
-    case Reconnect of
-	true ->
-	    #conn{pool_id = PoolId,
-		  pid = ConnPid,
-		  reconnect = true,
-		  host = Host,
-		  port = Port,
-		  user = User,
-		  password = Password,
-		  database = Database,
-		  encoding = Encoding
-		 };
-	false ->                        
-	    #conn{pool_id = PoolId,
-		  pid = ConnPid,
-		  reconnect = false}
-    end.
-
+    connect(PoolId, Host, ?PORT, User, Password, Database, undefined,
+	    Reconnect).
 
 %% gen_server callbacks
 
