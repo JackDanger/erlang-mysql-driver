@@ -414,12 +414,12 @@ send_reply(GenSrvFrom, Res) ->
     gen_server:reply(GenSrvFrom, Res).
 
 do_query(State, Query) ->
-    do_query(State#state.socket,
-	       State#state.recv_pid,
-	       State#state.log_fun,
-	       Query,
-	       State#state.mysql_version
-	      ).
+	do_query(State#state.socket,
+	         State#state.recv_pid,
+	         State#state.log_fun,
+	         Query,
+	         State#state.mysql_version
+	        ).
 
 do_query(Sock, RecvPid, LogFun, Query, Version) ->
 	Query1 = iolist_to_binary(Query),
@@ -434,71 +434,72 @@ do_query(Sock, RecvPid, LogFun, Query, Version) ->
 	end.
 
 do_queries(State, Queries) when not is_list(Queries) ->
-    do_query(State, Queries);
+	do_query(State, Queries);
 do_queries(State, Queries) ->
-    do_queries(State#state.socket,
-	       State#state.recv_pid,
-	       State#state.log_fun,
-	       Queries,
-	       State#state.mysql_version
-	      ).
+	do_queries(State#state.socket,
+	           State#state.recv_pid,
+	           State#state.log_fun,
+	           Queries,
+	           State#state.mysql_version
+	           ).
+
 
 %% Execute a list of queries, returning the response for the last query.
 %% If a query returns an error before the last query is executed, the
 %% loop is aborted and the error is returned. 
 do_queries(Sock, RecvPid, LogFun, Queries, Version) ->
-    catch
+	catch
 	lists:foldl(
-	  fun(Query, _LastResponse) ->
-		  case do_query(Sock, RecvPid, LogFun, Query, Version) of
-		      {error, _} = Err -> throw(Err);
-		      Res -> Res
-		  end
-	  end, ok, Queries).
+		fun(Query, _LastResponse) ->
+			case do_query(Sock, RecvPid, LogFun, Query, Version) of
+				{error, _} = Err -> throw(Err);
+					Res -> Res
+			end
+		end, ok, Queries).
 
 do_transaction(State, Fun) ->
-    case do_query(State, <<"BEGIN">>) of
- 	{error, _} = Err ->	
- 	    {aborted, Err};
- 	_ ->
-	    case catch Fun() of
-		error = Err -> rollback(State, Err);
-		{error, _} = Err -> rollback(State, Err);
-		{'EXIT', _} = Err -> rollback(State, Err);
-		Res ->
-		    case do_query(State, <<"COMMIT">>) of
-			{error, _} = Err ->
-			    rollback(State, {commit_error, Err});
-			_ ->
-			    case Res of
-				{atomic, _} -> Res;
-				_ -> {atomic, Res}
-			    end
-		    end
-	    end
-    end.
+	case do_query(State, <<"BEGIN">>) of
+		{error, _} = Err ->	
+			{aborted, Err};
+		_ ->
+			case catch Fun() of
+				error = Err -> rollback(State, Err);
+				{error, _} = Err -> rollback(State, Err);
+				{'EXIT', _} = Err -> rollback(State, Err);
+				Res ->
+					case do_query(State, <<"COMMIT">>) of
+						{error, _} = Err ->
+							rollback(State, {commit_error, Err});
+				_ ->
+					case Res of
+						{atomic, _} -> Res;
+						_ -> {atomic, Res}
+					end
+				end
+			end
+		end.
 
 rollback(State, Err) ->
-    Res = do_query(State, <<"ROLLBACK">>),
-    {aborted, {Err, {rollback_result, Res}}}.
+	Res = do_query(State, <<"ROLLBACK">>),
+	{aborted, {Err, {rollback_result, Res}}}.
 
 do_execute(State, Name, Params, ExpectedVersion) ->
-    Res = case gb_trees:lookup(Name, State#state.prepares) of
-	      {value, Version} when Version == ExpectedVersion ->
-		  {ok, latest};
-	      {value, Version} ->
-		  mysql:get_prepared(Name, Version);
-	      none ->
-		  mysql:get_prepared(Name)
-	  end,
-    case Res of
-	{ok, latest} ->
-	    {ok, do_execute1(State, Name, Params), State};
-	{ok, {Stmt, NewVersion}} ->
-	    prepare_and_exec(State, Name, NewVersion, Stmt, Params);
-	{error, _} = Err ->
-	    Err
-    end.
+	Res = case gb_trees:lookup(Name, State#state.prepares) of
+		{value, Version} when Version == ExpectedVersion ->
+			{ok, latest};
+		{value, Version} ->
+			mysql:get_prepared(Name, Version);
+		none ->
+			mysql:get_prepared(Name)
+	end,
+	case Res of
+		{ok, latest} ->
+			{ok, do_execute1(State, Name, Params), State};
+		{ok, {Stmt, NewVersion}} ->
+			prepare_and_exec(State, Name, NewVersion, Stmt, Params);
+		{error, _} = Err ->
+			Err
+	end.
 
 prepare_and_exec(State, Name, Version, Stmt, Params) ->
     NameBin = atom_to_binary(Name),
@@ -644,34 +645,33 @@ asciz(Data) when list(Data) ->
 %%           Reason       = term()
 %%--------------------------------------------------------------------
 get_query_response(LogFun, RecvPid, Version) ->
-    case do_recv(LogFun, RecvPid, undefined) of
-	{ok, <<Fieldcount:8, Rest/binary>>, _} ->
-	    case Fieldcount of
-		0 ->
-		    %% No Tabular data
-		    <<AffectedRows:8, _Rest2/binary>> = Rest,
-		    {updated, #mysql_result{affectedrows=AffectedRows}};
-		255 ->
-		    <<_Code:16/little, Message/binary>>  = Rest,
-		    {error, #mysql_result{error=Message}};
-		_ ->
-		    %% Tabular data received
-		    case get_fields(LogFun, RecvPid, [], Version) of
-			{ok, Fields} ->
-			    case get_rows(Fields, LogFun, RecvPid, []) of
-				{ok, Rows} ->
-				    {data, #mysql_result{fieldinfo=Fields,
-							 rows=Rows}};
-				{error, Reason} ->
-				    {error, #mysql_result{error=Reason}}
-			    end;
-			{error, Reason} ->
-			    {error, #mysql_result{error=Reason}}
-		    end
-	    end;
-	{error, Reason} ->
-	    {error, #mysql_result{error=Reason}}
-    end.
+	case do_recv(LogFun, RecvPid, undefined) of
+		{ok, <<Fieldcount:8, Rest/binary>>, _} ->
+			case Fieldcount of
+				0 ->
+					%% No Tabular data
+					<<AffectedRows:8, _Rest2/binary>> = Rest,
+					{updated, #mysql_result{affectedrows=AffectedRows}};
+				255 ->
+					<<_Code:16/little, Message/binary>>  = Rest,
+					{error, #mysql_result{error=Message}};
+				_ ->
+					%% Tabular data received
+					case get_fields(LogFun, RecvPid, [], Version) of
+						{ok, Fields} ->
+							case get_rows(Fields, LogFun, RecvPid, []) of
+								{ok, Rows} ->
+									{data, #mysql_result{fieldinfo=Fields, rows=Rows}};
+								{error, Reason} ->
+									{error, #mysql_result{error=Reason}}
+							end;
+						{error, Reason} ->
+							{error, #mysql_result{error=Reason}}
+					end
+		end;
+		{error, Reason} ->
+			{error, #mysql_result{error=Reason}}
+	end.
 
 %%--------------------------------------------------------------------
 %% Function: get_fields(LogFun, RecvPid, [], Version)
