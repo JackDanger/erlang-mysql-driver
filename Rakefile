@@ -20,5 +20,7 @@ rule ".beam" => ["%{debug_ebin,src}X.erl"]  do |t|
 	sh "erlc +debug_info -D EUNIT -pa debug_ebin -W #{ERLC_FLAGS} -o debug_ebin #{t.source} "
 end
 
+SRC = FileList['src/*.erl']
 
-task :default => ['ebin'] + FileList['src/*.erl'].pathmap("%{src,ebin}X.beam")
+task :default => ['ebin'] +       SRC.pathmap("%{src,ebin}X.beam")
+task :debug   => ['debug_ebin'] + SRC.pathmap("%{src,debug_ebin}X.beam")
