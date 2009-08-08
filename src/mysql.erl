@@ -109,6 +109,7 @@
 
 	 get_result_field_info/1,
 	 get_result_rows/1,
+	 get_full_result_rows/1,
 	 get_result_affected_rows/1,
 	 get_result_reason/1,
 
@@ -468,6 +469,27 @@ get_result_field_info(#mysql_result{fieldinfo = FieldInfo}) ->
 %% @spec get_result_rows(MySQLRes::mysql_result()) -> [Row::list()]
 get_result_rows(#mysql_result{rows=AllRows}) ->
     AllRows.
+
+%% @doc Extract the Rows with field names from MySQL Result on data received
+%%      Creates a proplist out of the fieldnames and data.
+%%
+%% @spec get_full_result_rows(MySQLRes::mysql_result()) ->
+%%                            [[{Field1, Row1Value1},..{FieldN, Row1ValueN}],
+%%                             [{Field1, Row2Value1},..{FieldN, Row2ValueN}]]
+get_full_result_rows(MysqlResult) ->
+	FieldNames = lists:map(
+		fun(Part) ->
+			{_Table, Field, _Length, _Type} = Part,
+			binary_to_list(Field)
+		end,
+		get_result_field_info(MysqlResult)
+	),
+	lists:map(
+		fun(Row) ->
+			lists:zip(FieldNames, Row)
+		end,
+		get_result_rows(MysqlResult)
+	).
 
 %% @doc Extract the Rows from MySQL Result on update
 %%
