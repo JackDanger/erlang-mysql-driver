@@ -24,3 +24,6 @@ SRC = FileList['src/*.erl']
 
 task :default => ['ebin'] +       SRC.pathmap("%{src,ebin}X.beam")
 task :debug   => ['debug_ebin'] + SRC.pathmap("%{src,debug_ebin}X.beam")
+task :test    => :debug do
+  sh "erlc test/mysql_test.erl && erl -eval \"mysql_test:test().\" -s erlang halt"
+end
