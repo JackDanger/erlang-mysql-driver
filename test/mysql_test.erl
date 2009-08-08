@@ -6,8 +6,11 @@
 -compile(export_all).
 
 test() ->
-    compile:file("/usr/local/lib/erlang/lib/mysql/mysql.erl"),
-    compile:file("/usr/local/lib/erlang/lib/mysql/mysql_conn.erl"),
+    compile:file(filename:dirname(?FILE) ++ "/../src/mysql.hrl"),
+    compile:file(filename:dirname(?FILE) ++ "/../src/mysql.erl"),
+    compile:file(filename:dirname(?FILE) ++ "/../src/mysql_conn.erl"),
+    compile:file(filename:dirname(?FILE) ++ "/../src/mysql_recv.erl"),
+    compile:file(filename:dirname(?FILE) ++ "/../src/mysql_auth.erl"),
     
     %% Start the MySQL dispatcher and create the first connection
     %% to the database. 'p1' is the connection pool identifier.
@@ -19,7 +22,14 @@ test() ->
     mysql:connect(p1, "localhost", undefined, "root", "password", "test",
 		  true),
     
-    mysql:fetch(p1, <<"DELETE FROM developer">>),
+    mysql:fetch(p1, <<"DROP TABLE developer">>),
+
+    mysql:fetch(p1, <<"CREATE TABLE developer("
+		                  "id integer auto_increment primary key,"
+		                  "name varchar(30),"
+		                  "country varchar(20),"
+		                  "created_on timestamp)"
+		                  "type=InnoDB;">>),
 
     mysql:fetch(p1, <<"INSERT INTO developer(name, country) VALUES "
 		     "('Claes (Klacke) Wikstrom', 'Sweden'),"
